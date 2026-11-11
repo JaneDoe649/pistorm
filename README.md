@@ -100,3 +100,10 @@ Install OpenOCD:
 Run the CPLD update with `./flash.sh`, this will automatically detect your CPLD version and flash appropriately.
 
 If successful "Flashing successful!" will appear, if not it will fail with "Flashing failed" and `nprog_log.txt` will be created with more details.
+
+# HDD activity LED patch
+
+A small patch for the PI ZERO 2W that, when used with this schematic, allows you to control the hard drive's activity LED using the Raspberry Pi's ACT LED.
+![Schematic]https://user-images.githubusercontent.com/68509630/170677291-d2b9ee67-50e2-4a0e-9966-0dc7c0f72339.png)
+
+**Please note: This patch has only been tested on the Pi Zero 2W and Amiga 2000.**
