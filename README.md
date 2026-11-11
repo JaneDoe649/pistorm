@@ -107,3 +107,13 @@ A small patch for the PI ZERO 2W that, when used with this schematic, allows you
 ![Schematic](https://user-images.githubusercontent.com/68509630/170677291-d2b9ee67-50e2-4a0e-9966-0dc7c0f72339.png)
 
 **Please note: This patch has only been tested on the Pi Zero 2W and Amiga 2000.**
+
+## Raspberry Pi OS Bookworm
+
+On Bookworm the default trigger of the ACT LED is `actpwr`, so the LED does not blink on SD card accesses during emulation. Switch it back to `mmc0` by adding this line to the `[all]` section (at the end) of `/boot/firmware/config.txt` (formerly `/boot/config.txt`), then reboot:
+
+```
+dtparam=act_led_trigger=mmc0
+```
+
+Check with `cat /sys/class/leds/ACT/trigger`: the active trigger is shown between brackets (`[mmc0]`). For a quick test without rebooting: `echo mmc0 | sudo tee /sys/class/leds/ACT/trigger`.
