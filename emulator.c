@@ -800,11 +800,15 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         case INTREQR:
           return amiga_handle_intrqr_read(res);
           break;
-        case CIAAPRA:
-          if (remote_mouse_buttons() & 0x01) {
-            // remote left button: pull FIR0 (bit 6) low on top of the real port state
+        case CIAAPRA: {
+          uint8_t rfire = remote_joystick_present() ? (remote_joystick_mask() & 0x10) : 0;
+          if ((remote_mouse_buttons() & 0x01) || rfire) {
+            // remote left button pulls FIR0 (bit 6) low, remote joystick fire pulls FIR1 (bit 7) low
             rres = (uint32_t)ps_read(type, addr);
-            rres &= ~0x40u;
+            if (remote_mouse_buttons() & 0x01)
+              rres &= ~0x40u;
+            if (rfire)
+              rres &= ~0x80u;
             if (swap_df0_with_dfx && spoof_df0_id)
               rres &= 0xDF;
             *res = rres;
@@ -823,7 +827,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             return 1;
           }
           return 0;
-          break;
+        }
         case CIAAICR:
           if ((kb_hook_enabled || remote_kb_active) && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
             *res = 0x88;
@@ -853,6 +857,13 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             // remote mouse only: add the offset to the real counters so the physical Amiga mouse keeps working
             uint16_t real = (uint16_t)ps_read(type, addr);
             *res = (unsigned int)((((real >> 8) + remote_mouse_y) & 0xFF) << 8 | (((real & 0xFF) + remote_mouse_x) & 0xFF));
+            return 1;
+          }
+          return 0;
+          break;
+        case JOY1DAT:
+          if (remote_joystick_present()) {
+            *res = remote_joystick_dat();
             return 1;
           }
           return 0;
@@ -889,6 +900,16 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           break;
         }
         case POTGOR:
+          if (remote_joystick_present() && (remote_joystick_mask() & 0x20)) {
+            // remote joystick second button (port 2, DATRY bit 14), active low, merged with the remote mouse buttons
+            uint32_t pot = (uint32_t)ps_read(type, addr);
+            uint8_t rb = remote_mouse_buttons();
+            pot &= ~0x4000u;
+            if (rb & 0x02) pot &= ~0x0400u;
+            if (rb & 0x04) pot &= ~0x0100u;
+            *res = pot;
+            return 1;
+          }
           if (remote_mouse_buttons() & 0x06) {
             // remote right (bit 10) and middle (bit 8) buttons are active low
             uint32_t pot = (uint32_t)ps_read(type, addr);

@@ -101,6 +101,7 @@ static void release_everything(void) {
       try_release(i);
   }
   clear_injected_mouse();
+  clear_injected_joystick();
 }
 
 static void handle_line(char *line) {
@@ -117,6 +118,10 @@ static void handle_line(char *line) {
     case 'B':
       if (sscanf(line + 1, "%d", &a) == 1)
         inject_mouse_buttons((uint8_t)a);
+      break;
+    case 'J':
+      if (sscanf(line + 1, "%d", &a) == 1)
+        inject_joystick((uint8_t)a);
       break;
     case 'W':
       // newmouse wheel up/down are the pseudo keys 0xfe/0xff in keymap_amiga, press only (as for the local mouse)

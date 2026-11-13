@@ -114,9 +114,21 @@ inputs keep working (the two sources are merged).
    `Control+Option+G` releases or re-grabs the inputs, `Control+Option+Q` quits. The Mac Command keys are the Amiga keys.
 
 The protocol is line based and can be driven by hand through the tunnel (`nc 127.0.0.1 7777`), see `input/remote_input.h`:
-`K <linux key code> <1|0>`, `M <dx> <dy>`, `B <button mask>`, `W <ticks>`, `P`.
-A client that disconnects has all its keys and buttons released automatically. The Amiga key queue holds 255 events,
+`K <linux key code> <1|0>`, `M <dx> <dy>`, `B <button mask>`, `W <ticks>`, `J <joystick mask>`, `P`.
+A client that disconnects has all its keys, buttons and joystick directions released automatically. The Amiga key queue holds 255 events,
 so clients should avoid sending key bursts faster than a few hundred events per second.
+
+### USB gamepad on Amiga port 2
+
+USB gamepads plugged into the Mac (any HID joystick or gamepad, read through IOHIDManager) are presented as a digital
+joystick on the Amiga **port 2**, while the keyboard and mouse are grabbed. The hat switch and the left stick move,
+button 1 is fire and button 2 is the second button. The mouse stays on port 1. Releasing the capture releases the
+gamepad too. `J <mask>` is the protocol line: 1 up, 2 down, 4 left, 8 right, 16 fire, 32 second button, 0 = idle.
+While a direction or button is pressed it replaces port 2 (`JOY1DAT`, fire on `CIAAPRA` bit 7, second button on
+`POTGOR` bit 14); when idle the real port 2 is read, so a real joystick still works. This only changes the values
+PiStorm hands back to the emulated 68000 when it reads these registers, nothing is driven on the Amiga's ports.
+`mac_client.py --no-gamepad` turns it off. Generic gamepads report their elements differently, so a model may need
+adjusting in `tools/remote-input/gamepad.py`.
 
 ## PiStorm Remote, the macOS application
 

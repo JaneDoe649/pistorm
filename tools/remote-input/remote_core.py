@@ -273,6 +273,7 @@ class Link:
         self.lock = threading.Lock()
         self.dx = self.dy = 0
         self.buttons = 0
+        self.joy = 0
         self.held = set()
         self.alive = True
         self._closing = False
@@ -331,6 +332,13 @@ class Link:
             self.key(code, False)
         self.buttons = 0
         self.send("B 0")
+        self.set_joystick(0)
+
+    def set_joystick(self, mask):
+        """Amiga port 2 joystick state (see gamepad.py for the bits); only sent when it changes."""
+        if mask != self.joy:
+            self.joy = mask
+            self.send("J %d" % mask)
 
     def add_motion(self, dx, dy):
         self.dx += dx
@@ -374,6 +382,7 @@ class Capture:
         self.on_grab_changed = on_grab_changed
         self.on_quit = on_quit
         self.grabbed = False
+        self.pad_mask = 0
         self._tap = None
         self._source = None
         self._runloop = None
@@ -424,12 +433,19 @@ class Capture:
         if on:
             Q.CGAssociateMouseAndMouseCursorPosition(False)
             Q.CGDisplayHideCursor(Q.CGMainDisplayID())
+            self.link.set_joystick(self.pad_mask)
         else:
             self.link.release_all()
             Q.CGAssociateMouseAndMouseCursorPosition(True)
             Q.CGDisplayShowCursor(Q.CGMainDisplayID())
         if self.on_grab_changed:
             self.on_grab_changed(on)
+
+    def set_pad_mask(self, mask):
+        """Gamepad state. It is only forwarded to the Amiga while the inputs are grabbed."""
+        self.pad_mask = mask
+        if self.grabbed and self.link.alive:
+            self.link.set_joystick(mask)
 
     def _motion_loop(self):
         while not self._stop.wait(1.0 / MOUSE_RATE_HZ):

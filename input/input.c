@@ -209,6 +209,54 @@ uint8_t remote_mouse_buttons(void) {
   return __atomic_load_n(&remote_buttons, __ATOMIC_RELAXED);
 }
 
+/**
+ * Remote joystick, presented on Amiga port 2 (JOY1DAT, fire on CIAAPRA bit 7, second button on POTGOR bit 14).
+ * Mask: 1 up, 2 down, 4 left, 8 right, 16 fire, 32 button 2. While the remote joystick has a direction or
+ * button pressed ("present"), it replaces whatever is on port 2; otherwise reads go to the real port.
+ */
+static uint8_t remote_joy = 0, remote_joy_on = 0;
+
+void inject_joystick(uint8_t mask) {
+  mask &= 0x3F;
+  __atomic_store_n(&remote_joy, mask, __ATOMIC_RELAXED);
+  // a centered remote joystick hands the port back to the real one
+  __atomic_store_n(&remote_joy_on, mask != 0, __ATOMIC_RELAXED);
+}
+
+void clear_injected_joystick(void) {
+  __atomic_store_n(&remote_joy, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&remote_joy_on, 0, __ATOMIC_RELAXED);
+}
+
+int remote_joystick_present(void) {
+  return __atomic_load_n(&remote_joy_on, __ATOMIC_RELAXED);
+}
+
+uint8_t remote_joystick_mask(void) {
+  return __atomic_load_n(&remote_joy, __ATOMIC_RELAXED);
+}
+
+// JOY1DAT word for a digital joystick: bit 1 right, bit 9 left, bit 0 = down^right, bit 8 = up^left.
+// Opposite directions cancel out.
+uint16_t remote_joystick_dat(void) {
+  uint8_t m = remote_joystick_mask();
+  int up = m & 1, down = (m >> 1) & 1, left = (m >> 2) & 1, right = (m >> 3) & 1;
+  if (up && down)
+    up = down = 0;
+  if (left && right)
+    left = right = 0;
+  uint16_t v = 0;
+  if (right)
+    v |= 0x0002;
+  if (left)
+    v |= 0x0200;
+  if (down ^ right)
+    v |= 0x0001;
+  if (up ^ left)
+    v |= 0x0100;
+  return v;
+}
+
 static inline int32_t clamp_step(int32_t v) {
   return v > REMOTE_STEP_MAX ? REMOTE_STEP_MAX : (v < -REMOTE_STEP_MAX ? -REMOTE_STEP_MAX : v);
 }

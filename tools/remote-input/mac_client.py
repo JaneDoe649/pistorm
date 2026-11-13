@@ -14,6 +14,8 @@ Usage:
     # or open the tunnel yourself:  ssh -N -L 7777:127.0.0.1:7777 pi@raspberrypi.local
     ./mac_client.py
 
+USB gamepads (hat, left stick, button 1 = fire, button 2 = second button) drive Amiga port 2 while grabbed.
+
 Hotkeys (Control+Option+...):
     G   release / re-grab the keyboard and mouse
     Q   quit
@@ -26,6 +28,7 @@ import subprocess
 import sys
 import time
 
+import gamepad
 import remote_core as core
 
 
@@ -54,6 +57,7 @@ def main():
     ap.add_argument("--ssh", metavar="USER@HOST", help="open the SSH tunnel to this Raspberry Pi")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7777)
+    ap.add_argument("--no-gamepad", action="store_true", help="don't forward USB gamepads to Amiga port 2")
     ap.add_argument("--start-released", action="store_true", help="don't grab the inputs at startup")
     args = ap.parse_args()
 
@@ -79,6 +83,16 @@ def main():
     except core.CaptureError as e:
         sys.exit(str(e))
     atexit.register(capture.uninstall)
+
+    if not args.no_gamepad and gamepad.GamepadMonitor.available():
+        def on_devices(names):
+            print("Gamepads: %s" % (", ".join(names) if names else "none"))
+        pads = gamepad.GamepadMonitor(capture.set_pad_mask, on_devices)
+        try:
+            pads.start()
+            atexit.register(pads.stop)
+        except Exception as e:  # noqa: BLE001  keyboard and mouse still work
+            print("Gamepad support disabled: %s" % e)
 
     if not args.start_released:
         capture.set_grab(True)

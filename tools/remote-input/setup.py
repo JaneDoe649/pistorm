@@ -4,7 +4,7 @@ from setuptools import setup
 
 OPTIONS = {
     "iconfile": "PiStormRemote.icns",
-    "includes": ["remote_core", "AppKit", "Foundation", "Quartz", "PyObjCTools.AppHelper"],
+    "includes": ["remote_core", "gamepad", "objc", "ctypes.util", "AppKit", "Foundation", "Quartz", "PyObjCTools.AppHelper"],
     "plist": {
         "CFBundleName": "PiStorm Remote",
         "CFBundleDisplayName": "PiStorm Remote",

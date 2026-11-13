@@ -16,9 +16,10 @@ from AppKit import (NSApplication, NSButton, NSColor, NSFont, NSMakeRect, NSMenu
 from Foundation import NSObject
 from PyObjCTools import AppHelper
 
+import gamepad
 import remote_core as core
 
-WIN_W, WIN_H = 380, 360
+WIN_W, WIN_H = 380, 384
 LABEL_X, LABEL_W = 20, 110
 FIELD_X, FIELD_W = 140, 220
 
@@ -42,6 +43,8 @@ class Controller:
         self.state = IDLE
         self.settings = None
         self.tunnel = self.link = self.capture = None
+        self.pad = None
+        self.pad_mask = 0
         self._gen = 0  # incremented on every cancel / disconnect so that late callbacks can be ignored
 
     # ---- user actions
@@ -76,6 +79,28 @@ class Controller:
     def shutdown(self):
         self._gen += 1
         self._teardown()
+        if self.pad:
+            self.pad.stop()
+            self.pad = None
+
+    # ---- gamepad (read all the time so that the window shows it, forwarded only while capturing)
+    def start_pads(self):
+        if not gamepad.GamepadMonitor.available():
+            self.view.render_pads(None)
+            return
+        try:
+            pad = gamepad.GamepadMonitor(self._pad_changed, self.view.render_pads)
+            pad.start()
+        except Exception as e:  # missing permission or bindings: the rest of the app must keep working
+            self.view.render_pads(None, str(e))
+            return
+        self.pad = pad
+        self.view.render_pads([])
+
+    def _pad_changed(self, mask):
+        self.pad_mask = mask
+        if self.capture:
+            self.capture.set_pad_mask(mask)
 
     # ---- worker thread
     def _connect_worker(self, gen, tunnel):
@@ -105,6 +130,7 @@ class Controller:
         self.link = link
         self.capture = core.Capture(link, on_grab_changed=self._grab_changed,
                                     on_quit=lambda: AppHelper.callAfter(self.disconnect))
+        self.capture.pad_mask = self.pad_mask
         try:
             self.capture.install()
         except core.CaptureError as e:
@@ -159,6 +185,7 @@ class MainWindow:
         self._build_window()
         self._load_settings()
         self.render(IDLE, "Déconnecté")
+        self.controller.start_pads()
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
 
     # ---- UI construction
@@ -239,6 +266,10 @@ class MainWindow:
         self.connect_b = self._button("Connecter", 20, 64, 165, "connectClicked:")
         self.connect_b.setKeyEquivalent_("\r")
         self.grab_b = self._button("Capturer", 195, 64, 165, "grabClicked:")
+
+        self.pad_label = self._label("Manette : aucune", LABEL_X, 98, WIN_W - 40)
+        self.pad_label.setFont_(NSFont.systemFontOfSize_(12))
+        self.pad_label.setTextColor_(NSColor.secondaryLabelColor())
 
         self.dot = self._label("●", 20, 22, 22, 28)
         self.dot.setFont_(NSFont.systemFontOfSize_(22))
@@ -339,6 +370,16 @@ class MainWindow:
         self.win.makeFirstResponder_(None)
 
     # ---- view
+    def render_pads(self, names, error=None):
+        # may be called from IOKit callbacks, which run on the main run loop
+        if names is None:
+            text = "Manette : non disponible" + (" (%s)" % error if error else " (module IOKit absent)")
+        elif names:
+            text = "Manette : " + ", ".join(names)
+        else:
+            text = "Manette : aucune"
+        self.pad_label.setStringValue_(text)
+
     def render(self, state, text):
         self.dot.setTextColor_(DOT_COLORS[state]())
         self.status.setStringValue_(text)
