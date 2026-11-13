@@ -17,3 +17,6 @@
 # macOS
 .DS_Store
 ._*
+
+# local scratch (config and ROM copies)
+/temp/
