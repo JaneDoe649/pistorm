@@ -46,6 +46,7 @@ typedef enum {
   CONFITEM_PLATFORM,
   CONFITEM_SETVAR,
   CONFITEM_KBFILE,
+  CONFITEM_REMOTEINPUT,
   CONFITEM_NUM,
 } config_items;
 
@@ -72,6 +73,9 @@ struct emulator_config {
   struct platform_config *platform;
 
   char *mouse_file, *keyboard_file;
+
+  // TCP port (loopback only) for remote keyboard/mouse injection, 0 = disabled
+  unsigned int remote_input_port;
 
   char mouse_toggle_key, keyboard_toggle_key;
   unsigned char mouse_enabled, mouse_autoconnect, keyboard_enabled, keyboard_grab, keyboard_autoconnect;

@@ -92,6 +92,32 @@ To exit the emulator you can press `Ctrl+C` (on the keyboard or over SSH) or pre
 
 For Amiga, there is currently no Gayle or IDE controller emulation available, but PiSCSI can now autoboot RDB/RDSK hard drive images (and physical drives), with Kickstart 2.0 and up. Check out the readme in `platforms/amiga/piscsi` for more detailed information.
 
+# Remote keyboard and mouse control (SSH)
+
+The emulator can accept keyboard and mouse events from another machine, for example a Mac, while the physical
+inputs keep working (the two sources are merged).
+
+1. Add this line to your `.cfg` file (Amiga platform only). The port is only opened on `127.0.0.1`, so nothing is exposed on the network:
+
+   ```
+   remoteinput 7777
+   ```
+
+2. On the Mac, install the dependency and run the client. It opens the SSH tunnel for you and grabs the keyboard and mouse:
+
+   ```
+   pip3 install pyobjc-framework-Quartz
+   ./tools/remote-input/mac_client.py --ssh pi@raspberrypi.local
+   ```
+
+   macOS asks for the *Input Monitoring* and *Accessibility* permissions for your terminal app on first use.
+   `Control+Option+G` releases or re-grabs the inputs, `Control+Option+Q` quits. The Mac Command keys are the Amiga keys.
+
+The protocol is line based and can be driven by hand through the tunnel (`nc 127.0.0.1 7777`), see `input/remote_input.h`:
+`K <linux key code> <1|0>`, `M <dx> <dy>`, `B <button mask>`, `W <ticks>`, `P`.
+A client that disconnects has all its keys and buttons released automatically. The Amiga key queue holds 255 events,
+so clients should avoid sending key bursts faster than a few hundred events per second.
+
 # CPLD bitstream update :
 
 Install OpenOCD:

@@ -41,6 +41,7 @@ const char *config_item_names[CONFITEM_NUM] = {
   "platform",
   "setvar",
   "kbfile",
+  "remoteinput",
 };
 
 const char *mapcmd_names[MAPCMD_NUM] = {
@@ -480,6 +481,17 @@ struct emulator_config *load_config_file(char *filename) {
         strcpy(cfg->keyboard_file, cur_cmd);
         printf("[CFG] Set keyboard event source file to %s.\n", cfg->keyboard_file);
         break;
+      case CONFITEM_REMOTEINPUT: {
+        get_next_string(parse_line, cur_cmd, &str_pos, ' ');
+        int port = atoi(cur_cmd);
+        if (port > 0 && port <= 65535) {
+          cfg->remote_input_port = (unsigned int)port;
+          printf("[CFG] Remote keyboard/mouse input will listen on 127.0.0.1:%d.\n", port);
+        } else {
+          printf("[CFG] Invalid remoteinput port '%s', remote input disabled.\n", cur_cmd);
+        }
+        break;
+      }
       case CONFITEM_PLATFORM: {
         char platform_name[128], platform_sub[128];
         memset(platform_name, 0x00, 128);

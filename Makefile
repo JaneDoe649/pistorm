@@ -5,6 +5,7 @@ MAINFILES        = emulator.c \
 	config_file/config_file.c \
 	config_file/rominfo.c \
 	input/input.c \
+	input/remote_input.c \
 	gpio/ps_protocol.c \
 	platforms/platforms.c \
 	platforms/amiga/amiga-autoconf.c \

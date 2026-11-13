@@ -4,6 +4,7 @@
 #include "emulator.h"
 #include "platforms/platforms.h"
 #include "input/input.h"
+#include "input/remote_input.h"
 #include "m68kcpu.h"
 
 #include "platforms/amiga/Gayle.h"
@@ -695,8 +696,16 @@ switch_config:
     printf("[MAIN] CPU thread created successfully\n");
   }
 
+  // create remote input task (keyboard/mouse injection over a loopback TCP port, meant to be used through an SSH tunnel)
+  if (cfg->remote_input_port && cfg->platform->id == PLATFORM_AMIGA) {
+    if (remote_input_start(cfg->remote_input_port) == 0)
+      printf("[MAIN] Remote input thread created successfully\n");
+  }
+
   // wait for cpu task to end before closing up and finishing
   pthread_join(cpu_tid, NULL);
+
+  remote_input_stop();
 
   while (!emulator_exiting) {
     emulator_exiting = 1;
