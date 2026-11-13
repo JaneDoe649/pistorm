@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "platforms/platforms.h"
@@ -285,6 +286,10 @@ static uint8_t queued_keypresses = 0, queue_output_pos = 0, queue_input_pos = 0;
 static uint8_t queued_keys[256];
 static uint8_t queued_events[256];
 
+// state of the emulated SDR, see below
+static uint8_t sdr_valid = 0, sdr_c = 0, sdr_t = 0, sp_flag = 0, irq_request = 0;
+static int64_t sdr_since_ms = 0;
+
 void clear_keypress_queue() {
   pthread_mutex_lock(&kb_queue_lock);
   memset(queued_keys, 0x80, 256);
@@ -292,6 +297,8 @@ void clear_keypress_queue() {
   __atomic_store_n(&queued_keypresses, 0, __ATOMIC_RELAXED);
   queue_output_pos = 0;
   queue_input_pos = 0;
+  __atomic_store_n(&sdr_valid, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&sp_flag, 0, __ATOMIC_RELAXED);
   pthread_mutex_unlock(&kb_queue_lock);
 }
 
@@ -345,8 +352,31 @@ static int queue_keypress_locked(uint8_t keycode, uint8_t event_type, uint8_t pl
   return 0;
 }
 
+/**
+ * The CIA-A serial data register (SDR, CIAADAT) as the Amiga sees it.
+ *
+ * The real SDR keeps the byte sent by the keyboard until the next one arrives, so every reader of an interrupt
+ * (keyboard.device, but also lowlevel.library's keyboard interrupt, games...) reads the same byte, any number of
+ * times. The keyboard only sends the next byte once the Amiga has done the handshake, a pulse of the SPMODE bit
+ * (bit 6) of CIAACRA. So the key at the head of the queue is "latched" into sdr_* and stays there, whatever the
+ * number of reads, until the handshake ends (kb_sdr_ack). Popping a key on every read, as was done before, makes
+ * a second reader swallow events.
+ *
+ * sp_flag is the SP bit of CIAAICR: raised when a key is latched, cleared by the first read of the ICR.
+ * Latching, reads and acknowledgement happen on the CPU thread; the other threads only look at the atomics.
+ */
+#define SDR_TIMEOUT_MSEC 150 // an Amiga that never does the handshake must not stall the keyboard for ever
+uint32_t kb_sdr_timeouts = 0;
+
+static int64_t coarse_msec(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Events not completely handed over to the Amiga: queued keys plus the one sitting in the SDR
 int get_num_kb_queued() {
-  return __atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED);
+  return __atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED) + __atomic_load_n(&sdr_valid, __ATOMIC_RELAXED);
 }
 
 void pop_queued_key(uint8_t *c, uint8_t *t) {
@@ -361,6 +391,76 @@ void pop_queued_key(uint8_t *c, uint8_t *t) {
     __atomic_fetch_sub(&queued_keypresses, 1, __ATOMIC_RELAXED);
   }
   pthread_mutex_unlock(&kb_queue_lock);
+}
+
+static int sdr_latch_next(void) {
+  if (__atomic_load_n(&sdr_valid, __ATOMIC_RELAXED))
+    return 1;
+  if (!__atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED))
+    return 0;
+  pop_queued_key(&sdr_c, &sdr_t);
+  sdr_since_ms = coarse_msec();
+  __atomic_store_n(&sp_flag, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&sdr_valid, 1, __ATOMIC_RELEASE);
+  return 1;
+}
+
+// CIAADAT read. Returns 0 if there is nothing to present (let the real register answer), 2 if a new key was
+// latched by this read, 1 if the same key is read again. may_latch: an emulated interrupt is pending.
+int kb_sdr_read(int may_latch, uint8_t *c, uint8_t *t) {
+  int fresh = 0;
+  if (!__atomic_load_n(&sdr_valid, __ATOMIC_ACQUIRE)) {
+    if (!may_latch || !sdr_latch_next())
+      return 0;
+    fresh = 1;
+  }
+  *c = sdr_c;
+  *t = sdr_t;
+  return fresh ? 2 : 1;
+}
+
+// CIAAICR read. Returns 1 if the SP flag must be reported by this read (and clears it).
+int kb_icr_sp_take(int may_latch) {
+  if (may_latch)
+    sdr_latch_next();
+  if (!__atomic_load_n(&sp_flag, __ATOMIC_RELAXED))
+    return 0;
+  __atomic_store_n(&sp_flag, 0, __ATOMIC_RELAXED);
+  return 1;
+}
+
+// The handshake ended: the Amiga is done with the byte in the SDR, the next key can be sent.
+void kb_sdr_ack(void) {
+  __atomic_store_n(&sp_flag, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&sdr_valid, 0, __ATOMIC_RELEASE);
+  kb_request_irq();
+}
+
+// CPU thread, every loop iteration: give up on a handshake that never comes
+void kb_sdr_tick(void) {
+  if (__atomic_load_n(&sdr_valid, __ATOMIC_RELAXED) && coarse_msec() - sdr_since_ms > SDR_TIMEOUT_MSEC) {
+    kb_sdr_timeouts++;
+    kb_sdr_ack();
+  }
+}
+
+// Is there something the Amiga has to be interrupted for?
+int kb_irq_wanted(void) {
+  return __atomic_load_n(&sp_flag, __ATOMIC_RELAXED) ||
+         (!__atomic_load_n(&sdr_valid, __ATOMIC_RELAXED) && __atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED));
+}
+
+// Any thread: ask the CPU thread to raise the keyboard interrupt, it is the only one touching the interrupt state
+void kb_request_irq(void) {
+  __atomic_store_n(&irq_request, 1, __ATOMIC_RELEASE);
+}
+
+// CPU thread: returns 1 if the keyboard interrupt must be raised now
+int kb_irq_poll(void) {
+  if (!__atomic_load_n(&irq_request, __ATOMIC_RELAXED))
+    return 0;
+  __atomic_store_n(&irq_request, 0, __ATOMIC_RELAXED);
+  return kb_irq_wanted();
 }
 
 int grab_device(int fd) {

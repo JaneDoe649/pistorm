@@ -72,7 +72,7 @@ void remote_diag_log_dat(uint8_t key, uint8_t event, int popped) {
   struct dat_log_entry *e = &dat_log[h % DAT_LOG_SIZE];
   e->key = key;
   e->event = event;
-  e->popped = popped != 0;
+  e->popped = (uint8_t)popped; // 0: real register, 1: same key read again, 2: new key latched
   e->icr = __atomic_load_n(&remote_diag_icr, __ATOMIC_RELAXED);
   e->dat = __atomic_load_n(&remote_diag_dat, __ATOMIC_RELAXED);
   e->acks = __atomic_load_n(&remote_diag_intreq, __ATOMIC_RELAXED);
@@ -85,8 +85,9 @@ static void print_dat_log(void) {
     dat_log_printed = head - DAT_LOG_SIZE; // overwritten entries are lost
   while (dat_log_printed != head) {
     struct dat_log_entry *e = &dat_log[dat_log_printed % DAT_LOG_SIZE];
-    printf("[REMOTE] Amiga read CIAADAT (%s): key=0x%02x event=%u | icr_reads=%u dat_pops=%u portsacks=%u\n",
-           e->popped ? "popped" : "not intercepted", e->key, e->event, e->icr, e->dat, e->acks);
+    printf("[REMOTE] Amiga read CIAADAT (%s): key=0x%02x event=%u | icr_sp_reports=%u dat_reads=%u portsacks=%u\n",
+           e->popped == 2 ? "new key" : (e->popped == 1 ? "same key again" : "not intercepted"), e->key, e->event,
+           e->icr, e->dat, e->acks);
     dat_log_printed++;
   }
 }
@@ -142,10 +143,9 @@ static void watch_queue(void) {
   }
 }
 
+// Never touch the interrupt state from here: ask the CPU thread, which is the only one raising PORTS
 static void kick_keyboard_irq(void) {
-  // same condition as keyboard_task in emulator.c
-  if (last_irq != 2)
-    amiga_emulate_irq(PORTS);
+  kb_request_irq();
 }
 
 static void try_release(int code) {
@@ -354,7 +354,7 @@ static void *remote_task(void *arg) {
     watch_queue();
     watch_held_keys();
     print_dat_log();
-    if (get_num_kb_queued())
+    if (kb_irq_wanted())
       kick_keyboard_irq();
     else if (client_fd == -1 && !pending_releases)
       remote_kb_active = 0; // queue drained after the last client left, hand the CIA back

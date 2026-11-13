@@ -25,5 +25,14 @@ uint16_t remote_joystick_dat(void);
 extern uint8_t remote_mouse_x, remote_mouse_y;
 int get_num_kb_queued();
 void pop_queued_key(uint8_t *c, uint8_t *t);
+// emulated CIA-A serial data register (keyboard), see input.c
+int kb_sdr_read(int may_latch, uint8_t *c, uint8_t *t);
+int kb_icr_sp_take(int may_latch);
+void kb_sdr_ack(void);
+void kb_sdr_tick(void);
+int kb_irq_wanted(void);
+void kb_request_irq(void);
+int kb_irq_poll(void);
+extern uint32_t kb_sdr_timeouts;
 int grab_device(int fd);
 int release_device(int fd);

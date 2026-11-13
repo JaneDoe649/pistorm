@@ -279,6 +279,10 @@ void *cpu_task() {
 
 cpu_loop:
   remote_mouse_poll();
+  // keyboard: the CPU thread is the only one raising the emulated PORTS interrupt, other threads only ask for it
+  kb_sdr_tick();
+  if (kb_irq_poll() && (kb_hook_enabled || remote_kb_active) && !amiga_emulating_irq(PORTS))
+    amiga_emulate_irq(PORTS);
   if (mouse_hook_enabled) {
     get_mouse_status(&mouse_dx, &mouse_dy, &mouse_buttons, &mouse_extra);
   }
@@ -389,8 +393,8 @@ key_loop:
 
   // if kpollrc > 0 then it contains number of events to pull, also check if POLLIN is set in revents
   if ((kpollrc <= 0) || !(kbdpoll[0].revents & POLLIN)) {
-    if (cfg->platform->id == PLATFORM_AMIGA && last_irq != 2 && get_num_kb_queued()) {
-      amiga_emulate_irq(PORTS);
+    if (cfg->platform->id == PLATFORM_AMIGA && kb_irq_wanted()) {
+      kb_request_irq();
     }
     goto key_loop;
   }
@@ -413,8 +417,8 @@ key_loop:
         }
       } else {
         if (queue_keypress(c_code, c_type, cfg->platform->id)) {
-          if (cfg->platform->id == PLATFORM_AMIGA && last_irq != 2) {
-            amiga_emulate_irq(PORTS);
+          if (cfg->platform->id == PLATFORM_AMIGA) {
+            kb_request_irq();
           }
         }
       }
@@ -831,27 +835,35 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return 0;
         }
         case CIAAICR:
-          if ((kb_hook_enabled || remote_kb_active) && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
+          // The keyboard byte is reported through the SP flag (0x88 = IR + SP), together with whatever the real
+          // CIA reports (timers, TOD...): replacing the register would hide those and leave the CIA interrupt
+          // line asserted. Reading the ICR clears the flag, as on the real chip.
+          if ((kb_hook_enabled || remote_kb_active) && kb_icr_sp_take(amiga_emulating_irq(PORTS))) {
             __atomic_fetch_add(&remote_diag_icr, 1, __ATOMIC_RELAXED);
-            *res = 0x88;
+            rres = (uint32_t)ps_read(type, addr);
+            *res = rres | 0x88;
             return 1;
           }
           return 0;
           break;
         case CIAADAT:
-          if ((kb_hook_enabled || remote_kb_active) && amiga_emulating_irq(PORTS)) {
+          // The SDR can be read any number of times (keyboard.device and lowlevel.library both read it in the same
+          // interrupt) and returns the same key until the keyboard handshake, see kb_sdr_read().
+          if (kb_hook_enabled || remote_kb_active) {
             uint8_t c = 0, t = 0;
-            __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
-            pop_queued_key(&c, &t);
+            int kind = kb_sdr_read(amiga_emulating_irq(PORTS), &c, &t);
+            if (kind) {
+              __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
+              if (remote_kb_active)
+                remote_diag_log_dat(c, t, kind);
+              t ^= 0x01;
+              rres = ((c << 1) | t) ^ 0xFF;
+              *res = rres;
+              return 1;
+            }
             if (remote_kb_active)
-              remote_diag_log_dat(c, t, 1);
-            t ^= 0x01;
-            rres = ((c << 1) | t) ^ 0xFF;
-            *res = rres;
-            return 1;
+              remote_diag_log_dat(0, 0, 0); // the real register answers
           }
-          if (remote_kb_active)
-            remote_diag_log_dat(0, 0, 0); // the Amiga read CIAADAT while no emulated key was pending
           return 0;
           break;
         case JOY0DAT:
@@ -1073,11 +1085,30 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
       break;
     case PLATFORM_AMIGA:
       switch (addr) {
-        case INTREQ:
+        case INTREQ: {
+          int handled;
           if ((val & 0x0008) && !(val & 0x8000))
             __atomic_fetch_add(&remote_diag_intreq, 1, __ATOMIC_RELAXED);
-          return amiga_handle_intrq_write(val);
+          handled = amiga_handle_intrq_write(val);
+          // PORTS acknowledged: if more keys are waiting, ask for the next interrupt
+          if ((val & 0x0008) && !(val & 0x8000) && (kb_hook_enabled || remote_kb_active))
+            kb_request_irq();
+          return handled;
           break;
+        }
+        case CIAACRA: {
+          // keyboard handshake: the Amiga sets SPMODE (bit 6) for a moment, and clears it when it is done with
+          // the byte. The write itself still goes to the real CIA.
+          static int spmode_out = 0;
+          if (kb_hook_enabled || remote_kb_active) {
+            int now = (val & 0x40) != 0;
+            if (spmode_out && !now)
+              kb_sdr_ack();
+            spmode_out = now;
+          }
+          return 0;
+          break;
+        }
         case CIAAPRA:
           if (ovl != (val & (1 << 0))) {
             ovl = (val & (1 << 0));
