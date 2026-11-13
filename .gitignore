@@ -13,3 +13,7 @@
 /m68kops.c
 /m68kops.h
 /emulator
+
+# macOS
+.DS_Store
+._*
