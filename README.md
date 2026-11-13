@@ -118,6 +118,26 @@ The protocol is line based and can be driven by hand through the tunnel (`nc 127
 A client that disconnects has all its keys and buttons released automatically. The Amiga key queue holds 255 events,
 so clients should avoid sending key bursts faster than a few hundred events per second.
 
+## PiStorm Remote, the macOS application
+
+`tools/remote-input/` also contains a small windowed version of the client, launched from the Finder. It shows the
+connection status (grey: disconnected, orange: connecting, blue: connected, green: capturing, red: error), keeps the
+host, user and ports between launches, and stores the SSH password in the macOS Keychain, never in a file.
+
+Build it once on the Mac (needs Xcode command line tools, which provide `python3`):
+
+```
+cd tools/remote-input
+./build_app.sh --install        # builds "PiStorm Remote.app" and copies it to /Applications
+```
+
+Then open *PiStorm Remote* from the Finder or Launchpad, fill in the Raspberry Pi address, the SSH user and the
+password, and press *Connecter*. On first launch macOS asks for the *Accessibility* and *Input Monitoring*
+permissions for the application. Leave the password empty to use an SSH key or the ssh-agent instead.
+The new host keys are trusted on first use, a changed key is refused. Settings live in
+`~/Library/Application Support/PiStormRemote/settings.json`. Rebuilding the application changes its signature, so
+macOS asks for the permissions again after a rebuild.
+
 # CPLD bitstream update :
 
 Install OpenOCD:
