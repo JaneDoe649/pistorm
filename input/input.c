@@ -147,19 +147,40 @@ int get_key_char(char *c, char *code, char *event_type)
 
 uint8_t mouse_x = 0, mouse_y = 0;
 
+int get_mouse_status(uint8_t *x, uint8_t *y, uint8_t *b, uint8_t *e) {
+  uint8_t mouse_ev[4];
+  if (read(mouse_fd, &mouse_ev, 4) != -1) {
+    *b = mouse_ev[0];
+    *e = mouse_ev[3];
+
+    mouse_x += mouse_ev[1];
+    *x = mouse_x;
+    mouse_y += (-mouse_ev[2]);
+    *y = mouse_y;
+    return 1;
+  }
+
+  return 0;
+}
+
 /**
- * Remote (injected) mouse state. Written by the remote input thread, consumed by the CPU thread
- * from get_mouse_status(). Everything is accessed with atomics so the CPU thread never blocks.
- * Deltas use screen orientation: +dx = right, +dy = down. Wheel: +n = up, -n = down.
+ * Remote (injected) mouse. The remote thread accumulates deltas and button state with atomics, the CPU thread
+ * calls remote_mouse_poll() every loop iteration to turn them into the counters below.
+ *
+ * remote_mouse_x/y are NOT a replacement for the Amiga mouse: they are an offset that platform_read_check()
+ * adds to the real JOY0DAT counters, so the physical mouse of the Amiga keeps working. Once non-zero the
+ * offset has to stay applied forever, as the Amiga only looks at differences between two reads.
+ * Deltas use screen orientation: +dx = right, +dy = down.
  */
 #define REMOTE_PENDING_LIMIT 4096
 #define REMOTE_STEP_MAX 16
-static int32_t remote_dx = 0, remote_dy = 0, remote_wheel = 0;
+static int32_t remote_dx = 0, remote_dy = 0;
 static uint8_t remote_buttons = 0;
+uint8_t remote_mouse_x = 0, remote_mouse_y = 0; // CPU thread only
 
 static void remote_accumulate(int32_t *target, int delta) {
   int32_t cur = __atomic_load_n(target, __ATOMIC_RELAXED);
-  // don't let the backlog grow without bound if the CPU thread isn't consuming (hook disabled)
+  // don't let the backlog grow without bound if the CPU thread isn't consuming
   if (cur + delta > REMOTE_PENDING_LIMIT || cur + delta < -REMOTE_PENDING_LIMIT)
     return;
   __atomic_fetch_add(target, delta, __ATOMIC_RELAXED);
@@ -173,71 +194,37 @@ void inject_mouse_move(int dx, int dy) {
 }
 
 void inject_mouse_buttons(uint8_t buttons) {
-  // bit 0: left, bit 1: right, bit 2: middle (same layout as the PS/2 packet)
+  // bit 0: left, bit 1: right, bit 2: middle
   __atomic_store_n(&remote_buttons, buttons & 0x07, __ATOMIC_RELAXED);
 }
 
-void inject_mouse_wheel(int steps) {
-  if (steps)
-    remote_accumulate(&remote_wheel, steps);
-}
-
 void clear_injected_mouse(void) {
+  // pending movement and buttons are dropped; the counters already applied must stay (see above)
   __atomic_store_n(&remote_dx, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&remote_dy, 0, __ATOMIC_RELAXED);
-  __atomic_store_n(&remote_wheel, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&remote_buttons, 0, __ATOMIC_RELAXED);
+}
+
+uint8_t remote_mouse_buttons(void) {
+  return __atomic_load_n(&remote_buttons, __ATOMIC_RELAXED);
 }
 
 static inline int32_t clamp_step(int32_t v) {
   return v > REMOTE_STEP_MAX ? REMOTE_STEP_MAX : (v < -REMOTE_STEP_MAX ? -REMOTE_STEP_MAX : v);
 }
 
-// Called from the CPU thread only. Merges the local PS/2 mouse (if any) and the injected remote state.
-int get_mouse_status(uint8_t *x, uint8_t *y, uint8_t *b, uint8_t *e) {
-  static uint8_t local_buttons = 0;
-  uint8_t mouse_ev[4];
-  int updated = 0, local_wheel = 0;
-
-  if (mouse_fd != -1 && read(mouse_fd, &mouse_ev, 4) != -1) {
-    local_buttons = mouse_ev[0];
-    *e = mouse_ev[3];
-    local_wheel = (mouse_ev[3] != 0);
-
-    mouse_x += mouse_ev[1];
-    mouse_y += (-mouse_ev[2]);
-    updated = 1;
-  }
-
-  // remote movement is consumed in small steps so the 8 bit counters never jump by more than the
-  // Amiga can disambiguate between two reads of JOY0DAT
+// Called from the CPU thread only. Moves are consumed in small steps so that the 8 bit counters never jump
+// by more than the Amiga can disambiguate between two reads of JOY0DAT.
+void remote_mouse_poll(void) {
   int32_t pdx = __atomic_load_n(&remote_dx, __ATOMIC_RELAXED);
   int32_t pdy = __atomic_load_n(&remote_dy, __ATOMIC_RELAXED);
   if (pdx || pdy) {
     int32_t sx = clamp_step(pdx), sy = clamp_step(pdy);
     __atomic_fetch_sub(&remote_dx, sx, __ATOMIC_RELAXED);
     __atomic_fetch_sub(&remote_dy, sy, __ATOMIC_RELAXED);
-    mouse_x += (uint8_t)sx;
-    mouse_y += (uint8_t)sy;
-    updated = 1;
+    remote_mouse_x += (uint8_t)sx;
+    remote_mouse_y += (uint8_t)sy;
   }
-
-  // one wheel tick per call; 0xff is wheel up and 0x01 wheel down (see cpu_task in emulator.c)
-  int32_t pw = __atomic_load_n(&remote_wheel, __ATOMIC_RELAXED);
-  if (pw && !local_wheel) {
-    int32_t step = pw > 0 ? 1 : -1;
-    __atomic_fetch_sub(&remote_wheel, step, __ATOMIC_RELAXED);
-    *e = (step > 0) ? 0xff : 0x01;
-    updated = 1;
-  }
-
-  *b = local_buttons | __atomic_load_n(&remote_buttons, __ATOMIC_RELAXED);
-
-  if (updated) {
-    *x = mouse_x;
-    *y = mouse_y;
-  }
-  return updated;
 }
 
 /**

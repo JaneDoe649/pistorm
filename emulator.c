@@ -47,6 +47,8 @@
 unsigned int ovl;
 
 int kb_hook_enabled = 0;
+// set by the remote input thread while a remote client may be sending keys; independent from the local keyboard hook
+int remote_kb_active = 0;
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -274,6 +276,7 @@ void *cpu_task() {
 	m68k_pulse_reset(state);
 
 cpu_loop:
+  remote_mouse_poll();
   if (mouse_hook_enabled) {
     get_mouse_status(&mouse_dx, &mouse_dy, &mouse_buttons, &mouse_extra);
   }
@@ -798,6 +801,15 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return amiga_handle_intrqr_read(res);
           break;
         case CIAAPRA:
+          if (remote_mouse_buttons() & 0x01) {
+            // remote left button: pull FIR0 (bit 6) low on top of the real port state
+            rres = (uint32_t)ps_read(type, addr);
+            rres &= ~0x40u;
+            if (swap_df0_with_dfx && spoof_df0_id)
+              rres &= 0xDF;
+            *res = rres;
+            return 1;
+          }
           if (mouse_hook_enabled && (mouse_buttons & 0x01)) {
             rres = (uint32_t)ps_read(type, addr);
             *res = (rres ^ 0x40);
@@ -813,14 +825,14 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return 0;
           break;
         case CIAAICR:
-          if (kb_hook_enabled && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
+          if ((kb_hook_enabled || remote_kb_active) && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
             *res = 0x88;
             return 1;
           }
           return 0;
           break;
         case CIAADAT:
-          if (kb_hook_enabled && amiga_emulating_irq(PORTS)) {
+          if ((kb_hook_enabled || remote_kb_active) && amiga_emulating_irq(PORTS)) {
             uint8_t c = 0, t = 0;
             pop_queued_key(&c, &t);
             t ^= 0x01;
@@ -832,8 +844,15 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           break;
         case JOY0DAT:
           if (mouse_hook_enabled) {
-            unsigned short result = (mouse_dy << 8) | (mouse_dx);
+            // Pi mouse replaces the Amiga one; the remote offset is added on top
+            unsigned short result = ((uint8_t)(mouse_dy + remote_mouse_y) << 8) | (uint8_t)(mouse_dx + remote_mouse_x);
             *res = (unsigned int)result;
+            return 1;
+          }
+          if (type == OP_TYPE_WORD && (remote_mouse_x || remote_mouse_y)) {
+            // remote mouse only: add the offset to the real counters so the physical Amiga mouse keeps working
+            uint16_t real = (uint16_t)ps_read(type, addr);
+            *res = (unsigned int)((((real >> 8) + remote_mouse_y) & 0xFF) << 8 | (((real & 0xFF) + remote_mouse_x) & 0xFF));
             return 1;
           }
           return 0;
@@ -870,6 +889,15 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           break;
         }
         case POTGOR:
+          if (remote_mouse_buttons() & 0x06) {
+            // remote right (bit 10) and middle (bit 8) buttons are active low
+            uint32_t pot = (uint32_t)ps_read(type, addr);
+            uint8_t rb = remote_mouse_buttons();
+            if (rb & 0x02) pot &= ~0x0400u;
+            if (rb & 0x04) pot &= ~0x0100u;
+            *res = pot;
+            return 1;
+          }
           if (mouse_hook_enabled) {
             unsigned short result = (unsigned short)ps_read(type, addr);
             // bit 1 rmb, bit 2 mmb

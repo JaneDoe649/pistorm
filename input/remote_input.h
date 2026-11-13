@@ -13,7 +13,7 @@
  *   K <linux_key_code> <1|0>   key press / release (Linux KEY_* codes; caps lock: send 1 on each toggle)
  *   M <dx> <dy>                relative mouse movement (+dx right, +dy down)
  *   B <mask>                   mouse buttons state (bit 0 left, bit 1 right, bit 2 middle)
- *   W <n>                      mouse wheel ticks (+ up, - down)
+ *   W <n>                      mouse wheel ticks (+ up, - down), at most 5 per line
  *   P                          ping, answered with "PONG"
  */
 

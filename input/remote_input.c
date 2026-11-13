@@ -25,7 +25,7 @@
 #include "platforms/platforms.h"
 
 // defined in emulator.c
-extern int kb_hook_enabled, mouse_hook_enabled;
+extern int remote_kb_active;
 extern uint32_t last_irq;
 
 #define LINE_MAX_LEN 128
@@ -119,8 +119,17 @@ static void handle_line(char *line) {
         inject_mouse_buttons((uint8_t)a);
       break;
     case 'W':
-      if (sscanf(line + 1, "%d", &a) == 1)
-        inject_mouse_wheel(a);
+      // newmouse wheel up/down are the pseudo keys 0xfe/0xff in keymap_amiga, press only (as for the local mouse)
+      if (sscanf(line + 1, "%d", &a) == 1) {
+        int n = a < 0 ? -a : a;
+        if (n > 5)
+          n = 5;
+        for (int i = 0; i < n; i++) {
+          if (!queue_remote_keypress(a > 0 ? 0xfe : 0xff, KEYPRESS_PRESS, PLATFORM_AMIGA))
+            break;
+          kick_keyboard_irq();
+        }
+      }
       break;
     case 'P':
       if (client_fd != -1)
@@ -154,10 +163,11 @@ static void accept_client(void) {
   fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
   client_fd = fd;
 
-  // remote input is useless unless the hooks are on, so a connection switches them on
-  kb_hook_enabled = 1;
-  mouse_hook_enabled = 1;
-  printf("[REMOTE] Client connected, keyboard and mouse hooks enabled\n");
+  // The mouse needs no hook: the remote offset is added to the real counters. Keys go through the key queue,
+  // which the CIA reads serve only while remote_kb_active is set; the Amiga's own keyboard keeps working
+  // when nothing is queued.
+  remote_kb_active = 1;
+  printf("[REMOTE] Client connected\n");
 }
 
 static void read_client(void) {
@@ -234,6 +244,8 @@ static void *remote_task(void *arg) {
     flush_pending_releases();
     if (get_num_kb_queued())
       kick_keyboard_irq();
+    else if (client_fd == -1 && !pending_releases)
+      remote_kb_active = 0; // queue drained after the last client left, hand the CIA back
   }
 
   drop_client();
