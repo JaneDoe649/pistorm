@@ -49,6 +49,8 @@ unsigned int ovl;
 int kb_hook_enabled = 0;
 // set by the remote input thread while a remote client may be sending keys; independent from the local keyboard hook
 int remote_kb_active = 0;
+// freeze diagnostics, read by remote_input.c (relaxed counters, only touched on the hooked accesses)
+uint32_t remote_diag_icr = 0, remote_diag_dat = 0, remote_diag_intreq = 0;
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -830,6 +832,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         }
         case CIAAICR:
           if ((kb_hook_enabled || remote_kb_active) && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
+            __atomic_fetch_add(&remote_diag_icr, 1, __ATOMIC_RELAXED);
             *res = 0x88;
             return 1;
           }
@@ -838,6 +841,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         case CIAADAT:
           if ((kb_hook_enabled || remote_kb_active) && amiga_emulating_irq(PORTS)) {
             uint8_t c = 0, t = 0;
+            __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
             pop_queued_key(&c, &t);
             t ^= 0x01;
             rres = ((c << 1) | t) ^ 0xFF;
@@ -1066,6 +1070,8 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
     case PLATFORM_AMIGA:
       switch (addr) {
         case INTREQ:
+          if ((val & 0x0008) && !(val & 0x8000))
+            __atomic_fetch_add(&remote_diag_intreq, 1, __ATOMIC_RELAXED);
           return amiga_handle_intrq_write(val);
           break;
         case CIAAPRA:

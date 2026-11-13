@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include "input/input.h"
+#include "m68k.h"
 #include "input/remote_input.h"
 #include "platforms/amiga/amiga-interrupts.h"
 #include "platforms/platforms.h"
@@ -30,6 +31,9 @@ extern int remote_kb_active;
 extern uint32_t last_irq;
 extern int irq;                // set by ipl_task: an interrupt is pending, the CPU then runs in tiny slices
 extern uint16_t emulated_irqs; // platforms/amiga/amiga-interrupts.c
+extern uint32_t last_last_irq;
+extern uint8_t ipl_enabled[8];
+extern uint32_t remote_diag_icr, remote_diag_dat, remote_diag_intreq; // emulator.c
 
 #define LINE_MAX_LEN 128
 // how often the thread wakes up to retry queued releases / re-raise the keyboard interrupt
@@ -58,6 +62,7 @@ static int64_t now_msec(void) {
 static void watch_queue(void) {
   static int64_t nonempty_since = 0;
   static int reported = 0;
+  static uint32_t snap_icr, snap_dat, snap_intreq;
   int queued = get_num_kb_queued();
 
   if (!queued) {
@@ -66,12 +71,24 @@ static void watch_queue(void) {
     return;
   }
   int64_t now = now_msec();
-  if (!nonempty_since)
+  if (!nonempty_since) {
     nonempty_since = now;
+    snap_icr = __atomic_load_n(&remote_diag_icr, __ATOMIC_RELAXED);
+    snap_dat = __atomic_load_n(&remote_diag_dat, __ATOMIC_RELAXED);
+    snap_intreq = __atomic_load_n(&remote_diag_intreq, __ATOMIC_RELAXED);
+  }
   if (!reported && now - nonempty_since >= STUCK_QUEUE_MSEC) {
     reported = 1;
     printf("[REMOTE] queue stuck for %d ms: queued=%d emulated_irqs=0x%04x emulated_ipl=%u last_irq=%u irq=%d\n",
            STUCK_QUEUE_MSEC, queued, (unsigned)emulated_irqs, (unsigned)amiga_emulated_ipl(), (unsigned)last_irq, irq);
+    // what the Amiga did since the queue became non-empty: ICR reads answered 0x88, CIAADAT pops, PORTS acknowledged
+    // (INTREQ writes). SR/PC are read from another thread, so they are only a hint.
+    printf("[REMOTE]   since then: icr=%u dat=%u intreq_ports=%u | last_last_irq=%u ipl_enabled[2]=%u cpu SR=%04x PC=%08x\n",
+           (unsigned)(__atomic_load_n(&remote_diag_icr, __ATOMIC_RELAXED) - snap_icr),
+           (unsigned)(__atomic_load_n(&remote_diag_dat, __ATOMIC_RELAXED) - snap_dat),
+           (unsigned)(__atomic_load_n(&remote_diag_intreq, __ATOMIC_RELAXED) - snap_intreq),
+           (unsigned)last_last_irq, (unsigned)ipl_enabled[2],
+           m68k_get_reg(NULL, M68K_REG_SR), m68k_get_reg(NULL, M68K_REG_PC));
   }
 }
 
