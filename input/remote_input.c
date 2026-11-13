@@ -46,15 +46,33 @@ static volatile int remote_stop = 0;
 static unsigned int remote_port = 0;
 
 static int listen_fd = -1, client_fd = -1;
-static uint8_t key_down[256], key_release_pending[256];
+static uint8_t key_down[256], key_release_pending[256], key_held_reported[256];
+static int64_t key_down_at[256];
 static int pending_releases = 0;
 
-#define STUCK_QUEUE_MSEC 2000
+#define STUCK_QUEUE_MSEC 800
+#define KEY_HELD_MSEC 800 // log a key that stays down longer than this: its release has not reached us
 
 static int64_t now_msec(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Diagnostics: a key that stays down on our side for a while means the client's release is late or lost
+// (as opposed to the Amiga reading it late, which watch_queue reports).
+static void watch_held_keys(void) {
+  int64_t now = 0;
+  for (int i = 0; i < 256; i++) {
+    if (!key_down[i] || key_held_reported[i])
+      continue;
+    if (!now)
+      now = now_msec();
+    if (now - key_down_at[i] >= KEY_HELD_MSEC) {
+      key_held_reported[i] = 1;
+      printf("[REMOTE] key %d down for %d ms, no release received from the client yet\n", i, KEY_HELD_MSEC);
+    }
+  }
 }
 
 // Diagnostics for the Amiga freezes: when the Amiga keeps not reading the keys we queued, log the state of the
@@ -138,9 +156,13 @@ static void handle_key(int code, int pressed) {
       return;
     if (queue_remote_keypress(code, KEYPRESS_PRESS, PLATFORM_AMIGA)) {
       key_down[code] = 1;
+      key_held_reported[code] = 0;
+      key_down_at[code] = now_msec();
       kick_keyboard_irq();
     }
   } else if (key_down[code]) {
+    if (key_held_reported[code])
+      printf("[REMOTE] key %d released after %d ms\n", code, (int)(now_msec() - key_down_at[code]));
     try_release(code);
   }
 }
@@ -298,6 +320,7 @@ static void *remote_task(void *arg) {
     // a keypress is only delivered if the Amiga services the interrupt; keep asking until the queue drains
     flush_pending_releases();
     watch_queue();
+    watch_held_keys();
     if (get_num_kb_queued())
       kick_keyboard_irq();
     else if (client_fd == -1 && !pending_releases)
