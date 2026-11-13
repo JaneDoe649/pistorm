@@ -843,11 +843,15 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             uint8_t c = 0, t = 0;
             __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
             pop_queued_key(&c, &t);
+            if (remote_kb_active)
+              remote_diag_log_dat(c, t, 1);
             t ^= 0x01;
             rres = ((c << 1) | t) ^ 0xFF;
             *res = rres;
             return 1;
           }
+          if (remote_kb_active)
+            remote_diag_log_dat(0, 0, 0); // the Amiga read CIAADAT while no emulated key was pending
           return 0;
           break;
         case JOY0DAT:

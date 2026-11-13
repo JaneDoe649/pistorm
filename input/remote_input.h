@@ -19,7 +19,12 @@
  *   P                          ping, answered with "PONG"
  */
 
+#include <stdint.h>
+
 int remote_input_start(unsigned int port);
 void remote_input_stop(void);
+
+// diagnostics: called by the CPU thread on every CIAADAT read while remote input is active
+void remote_diag_log_dat(uint8_t key, uint8_t event, int popped);
 
 #endif

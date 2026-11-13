@@ -59,6 +59,38 @@ static int64_t now_msec(void) {
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+// Reads of CIAADAT by the Amiga, recorded by the CPU thread (no printf there) and printed by this thread.
+// Each read pops one queued key, whereas the real register can be read any number of times: two readers
+// (or a handler reading twice) would swallow events, which is what this log is meant to show.
+#define DAT_LOG_SIZE 64
+struct dat_log_entry { uint8_t key, event, popped; uint32_t icr, dat, acks; };
+static struct dat_log_entry dat_log[DAT_LOG_SIZE];
+static uint32_t dat_log_head = 0, dat_log_printed = 0;
+
+void remote_diag_log_dat(uint8_t key, uint8_t event, int popped) {
+  uint32_t h = __atomic_load_n(&dat_log_head, __ATOMIC_RELAXED);
+  struct dat_log_entry *e = &dat_log[h % DAT_LOG_SIZE];
+  e->key = key;
+  e->event = event;
+  e->popped = popped != 0;
+  e->icr = __atomic_load_n(&remote_diag_icr, __ATOMIC_RELAXED);
+  e->dat = __atomic_load_n(&remote_diag_dat, __ATOMIC_RELAXED);
+  e->acks = __atomic_load_n(&remote_diag_intreq, __ATOMIC_RELAXED);
+  __atomic_store_n(&dat_log_head, h + 1, __ATOMIC_RELEASE);
+}
+
+static void print_dat_log(void) {
+  uint32_t head = __atomic_load_n(&dat_log_head, __ATOMIC_ACQUIRE);
+  if (head - dat_log_printed > DAT_LOG_SIZE)
+    dat_log_printed = head - DAT_LOG_SIZE; // overwritten entries are lost
+  while (dat_log_printed != head) {
+    struct dat_log_entry *e = &dat_log[dat_log_printed % DAT_LOG_SIZE];
+    printf("[REMOTE] Amiga read CIAADAT (%s): key=0x%02x event=%u | icr_reads=%u dat_pops=%u portsacks=%u\n",
+           e->popped ? "popped" : "not intercepted", e->key, e->event, e->icr, e->dat, e->acks);
+    dat_log_printed++;
+  }
+}
+
 // Diagnostics: a key that stays down on our side for a while means the client's release is late or lost
 // (as opposed to the Amiga reading it late, which watch_queue reports).
 static void watch_held_keys(void) {
@@ -321,6 +353,7 @@ static void *remote_task(void *arg) {
     flush_pending_releases();
     watch_queue();
     watch_held_keys();
+    print_dat_log();
     if (get_num_kb_queued())
       kick_keyboard_irq();
     else if (client_fd == -1 && !pending_releases)
