@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "input/input.h"
@@ -27,6 +28,8 @@
 // defined in emulator.c
 extern int remote_kb_active;
 extern uint32_t last_irq;
+extern int irq;                // set by ipl_task: an interrupt is pending, the CPU then runs in tiny slices
+extern uint16_t emulated_irqs; // platforms/amiga/amiga-interrupts.c
 
 #define LINE_MAX_LEN 128
 // how often the thread wakes up to retry queued releases / re-raise the keyboard interrupt
@@ -41,6 +44,36 @@ static unsigned int remote_port = 0;
 static int listen_fd = -1, client_fd = -1;
 static uint8_t key_down[256], key_release_pending[256];
 static int pending_releases = 0;
+
+#define STUCK_QUEUE_MSEC 2000
+
+static int64_t now_msec(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Diagnostics for the Amiga freezes: when the Amiga keeps not reading the keys we queued, log the state of the
+// interrupt emulation once per episode. Read only, it changes nothing.
+static void watch_queue(void) {
+  static int64_t nonempty_since = 0;
+  static int reported = 0;
+  int queued = get_num_kb_queued();
+
+  if (!queued) {
+    nonempty_since = 0;
+    reported = 0;
+    return;
+  }
+  int64_t now = now_msec();
+  if (!nonempty_since)
+    nonempty_since = now;
+  if (!reported && now - nonempty_since >= STUCK_QUEUE_MSEC) {
+    reported = 1;
+    printf("[REMOTE] queue stuck for %d ms: queued=%d emulated_irqs=0x%04x emulated_ipl=%u last_irq=%u irq=%d\n",
+           STUCK_QUEUE_MSEC, queued, (unsigned)emulated_irqs, (unsigned)amiga_emulated_ipl(), (unsigned)last_irq, irq);
+  }
+}
 
 static void kick_keyboard_irq(void) {
   // same condition as keyboard_task in emulator.c
@@ -247,6 +280,7 @@ static void *remote_task(void *arg) {
 
     // a keypress is only delivered if the Amiga services the interrupt; keep asking until the queue drains
     flush_pending_releases();
+    watch_queue();
     if (get_num_kb_queued())
       kick_keyboard_irq();
     else if (client_fd == -1 && !pending_releases)
