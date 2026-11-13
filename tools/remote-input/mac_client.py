@@ -87,7 +87,11 @@ def main():
     if not args.no_gamepad and gamepad.GamepadMonitor.available():
         def on_devices(names):
             print("Gamepads: %s" % (", ".join(names) if names else "none"))
-        pads = gamepad.GamepadMonitor(capture.set_pad_mask, on_devices)
+        def on_pad(mask):
+            print("Gamepad mask %d%s" % (mask, "" if capture.grabbed else " (not sent: inputs released)"))
+            capture.set_pad_mask(mask)
+
+        pads = gamepad.GamepadMonitor(on_pad, on_devices)
         try:
             pads.start()
             atexit.register(pads.stop)

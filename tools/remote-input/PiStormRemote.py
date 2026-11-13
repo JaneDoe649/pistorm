@@ -45,6 +45,7 @@ class Controller:
         self.tunnel = self.link = self.capture = None
         self.pad = None
         self.pad_mask = 0
+        self.pad_names = []
         self._gen = 0  # incremented on every cancel / disconnect so that late callbacks can be ignored
 
     # ---- user actions
@@ -89,7 +90,7 @@ class Controller:
             self.view.render_pads(None)
             return
         try:
-            pad = gamepad.GamepadMonitor(self._pad_changed, self.view.render_pads)
+            pad = gamepad.GamepadMonitor(self._pad_changed, self._pad_devices)
             pad.start()
         except Exception as e:  # missing permission or bindings: the rest of the app must keep working
             self.view.render_pads(None, str(e))
@@ -97,10 +98,18 @@ class Controller:
         self.pad = pad
         self.view.render_pads([])
 
+    def _pad_devices(self, names):
+        self.pad_names = list(names)
+        self.view.render_pads(self.pad_names, mask=self.pad_mask, sending=self._pad_sending())
+
+    def _pad_sending(self):
+        return bool(self.capture and self.capture.grabbed and self.link and self.link.alive)
+
     def _pad_changed(self, mask):
         self.pad_mask = mask
         if self.capture:
             self.capture.set_pad_mask(mask)
+        self.view.render_pads(self.pad_names, mask=mask, sending=self._pad_sending())
 
     # ---- worker thread
     def _connect_worker(self, gen, tunnel):
@@ -143,6 +152,7 @@ class Controller:
             self.capture.set_grab(True)
 
     def _grab_changed(self, on):
+        self.view.render_pads(self.pad_names, mask=self.pad_mask, sending=on and self._pad_sending())
         if self.state in (CONNECTED, CAPTURING):
             if on:
                 self._set(CAPTURING, "Capture active. Ctrl+Option+G pour libérer")
@@ -370,12 +380,17 @@ class MainWindow:
         self.win.makeFirstResponder_(None)
 
     # ---- view
-    def render_pads(self, names, error=None):
+    def render_pads(self, names, error=None, mask=0, sending=False):
         # may be called from IOKit callbacks, which run on the main run loop
         if names is None:
             text = "Manette : non disponible" + (" (%s)" % error if error else " (module IOKit absent)")
         elif names:
             text = "Manette : " + ", ".join(names)
+            if mask:
+                labels = [n for b, n in ((gamepad.UP, "haut"), (gamepad.DOWN, "bas"), (gamepad.LEFT, "gauche"),
+                                         (gamepad.RIGHT, "droite"), (gamepad.FIRE, "tir"),
+                                         (gamepad.BUTTON2, "bouton 2")) if mask & b]
+                text += " [%s]%s" % (" ".join(labels), "" if sending else " (non transmis)")
         else:
             text = "Manette : aucune"
         self.pad_label.setStringValue_(text)

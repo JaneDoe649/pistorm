@@ -175,11 +175,21 @@ class GamepadMonitor:
 
         iokit, cf, modes = _load()
         self._iokit, self._cf, self._modes = iokit, cf, modes
-        ref = lambda o: ctypes.c_void_p(objc.pyobjc_id(o))  # toll-free bridged CF object -> raw pointer
+        def ref(o):
+            # toll-free bridged CF object -> raw pointer. PyObjC hands NSString back as a str subclass,
+            # whose real object is nsstring()
+            if hasattr(o, "nsstring"):
+                o = o.nsstring()
+            return ctypes.c_void_p(objc.pyobjc_id(o))
+
+        self._product_key = NSString.stringWithString_("Product")  # kept alive for the whole run
 
         def device_name(device):
-            ptr = iokit.IOHIDDeviceGetProperty(device, ref(NSString.stringWithString_("Product")))
-            return str(objc.objc_object(c_void_p=ptr)) if ptr else "Manette"
+            try:
+                ptr = iokit.IOHIDDeviceGetProperty(device, ref(self._product_key))
+                return str(objc.objc_object(c_void_p=ctypes.c_void_p(ptr))) if ptr else "Manette"
+            except Exception:  # noqa: BLE001  the name is cosmetic, the pad must work anyway
+                return "Manette"
 
         def attached(ctx, result, sender, device):
             self._pads[device] = (device_name(device), PadState())
@@ -219,6 +229,7 @@ class GamepadMonitor:
         mgr = iokit.IOHIDManagerCreate(None, 0)
         if not mgr:
             raise RuntimeError("IOHIDManagerCreate a échoué")
+        self._matching = matching
         iokit.IOHIDManagerSetDeviceMatchingMultiple(mgr, ref(matching))
         iokit.IOHIDManagerRegisterDeviceMatchingCallback(mgr, self._callbacks[0], None)
         iokit.IOHIDManagerRegisterDeviceRemovalCallback(mgr, self._callbacks[1], None)
@@ -235,3 +246,66 @@ class GamepadMonitor:
             self._manager = None
         self._pads.clear()
         self._emit()
+
+
+def _diagnostic():
+    """python3 gamepad.py: live table of the gamepads, one line per HID element, plus the Amiga mask."""
+    import sys
+    import threading
+    import time
+    if not GamepadMonitor.available():
+        sys.exit("IOKit/PyObjC indisponible (macOS requis)")
+    import Quartz as Q
+
+    latest = {}   # (page, usage) -> [value, min, max, last change time, count]
+    state = {"mask": 0, "names": []}
+    names = {UP: "HAUT", DOWN: "BAS", LEFT: "GAUCHE", RIGHT: "DROITE", FIRE: "TIR", BUTTON2: "BOUTON2"}
+
+    def on_change(m):
+        state["mask"] = m
+
+    mon = GamepadMonitor(on_change, lambda n: state.__setitem__("names", list(n)))
+    orig = PadState.update
+
+    def traced(self, page, usage, value, lmin, lmax):
+        e = latest.setdefault((page, usage), [value, lmin, lmax, 0.0, 0])
+        if e[0] != value or e[4] == 0:
+            e[3] = time.time()
+        e[:3] = [value, lmin, lmax]
+        e[4] += 1
+        return orig(self, page, usage, value, lmin, lmax)
+
+    PadState.update = traced
+    mon.start()
+
+    def draw():
+        last = None
+        while True:
+            time.sleep(0.1)
+            now = time.time()
+            rows = sorted(latest.items())
+            snap = (state["mask"], tuple(state["names"]), tuple((k, v[0]) for k, v in rows))
+            if snap == last:
+                continue
+            last = snap
+            out = ["\033[H\033[J", "Manettes : %s\n" % (", ".join(state["names"]) or "aucune"),
+                   "Masque Amiga : %2d  %s\n\n" % (state["mask"], " ".join(
+                       n for b, n in names.items() if state["mask"] & b) or "-"),
+                   "%-6s %-6s %8s %14s   %s\n" % ("page", "usage", "valeur", "plage", "")]
+            for (page, usage), (val, lo, hi, t, _) in rows:
+                mark = "<--" if now - t < 1.0 else ""
+                out.append("0x%02x   0x%02x   %8d %14s   %s\n" % (page, usage, val, "[%d,%d]" % (lo, hi), mark))
+            out.append("\nCtrl+C pour quitter. Rien ? Autorisez le Terminal dans Réglages Système > "
+                       "Confidentialité > Surveillance de l'entrée.\n")
+            sys.stdout.write("".join(out))
+            sys.stdout.flush()
+
+    threading.Thread(target=draw, daemon=True).start()
+    try:
+        Q.CFRunLoopRun()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    _diagnostic()
