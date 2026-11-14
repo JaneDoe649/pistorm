@@ -501,8 +501,6 @@ class Capture:
         elif etype in (Q.kCGEventOtherMouseDown, Q.kCGEventOtherMouseUp):
             if Q.CGEventGetIntegerValueField(event, Q.kCGMouseEventButtonNumber) == 2:
                 self._set_button(4, etype == Q.kCGEventOtherMouseDown)
-        elif etype == Q.kCGEventScrollWheel:
-            delta = Q.CGEventGetIntegerValueField(event, Q.kCGScrollWheelEventDeltaAxis1)
-            if delta:
-                link.send("W %d" % max(-5, min(5, delta)))
+        # the scroll wheel is not forwarded (few Amiga programs use it) but it is still swallowed, so that it does not
+        # scroll the Mac while the inputs are grabbed
         return None  # swallow: nothing reaches the Mac while grabbed

@@ -159,19 +159,6 @@ static void handle_line(char *line) {
         DIAG(remote_diag_joystick(a);)
       }
       break;
-    case 'W':
-      // newmouse wheel up/down are the pseudo keys 0xfe/0xff in keymap_amiga, press only (as for the local mouse)
-      if (sscanf(line + 1, "%d", &a) == 1) {
-        int n = a < 0 ? -a : a;
-        if (n > 5)
-          n = 5;
-        for (int i = 0; i < n; i++) {
-          if (!queue_remote_keypress(a > 0 ? 0xfe : 0xff, KEYPRESS_PRESS, PLATFORM_AMIGA))
-            break;
-          kick_keyboard_irq();
-        }
-      }
-      break;
     case 'P':
       if (client_fd != -1)
         (void)!write(client_fd, "PONG\n", 5);
