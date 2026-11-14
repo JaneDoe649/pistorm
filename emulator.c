@@ -64,6 +64,11 @@ int32_t remote_diag_pra_type = -1, remote_diag_pra_fire = -1, remote_diag_ddra =
 uint32_t remote_diag_dump_addr = 0;
 int remote_diag_dump_req = 0, remote_diag_dump_done = 0;
 uint8_t remote_diag_dump_buf[CODE_DUMP_SIZE];
+// also copied by the CPU thread: the level 2 handler (autovector at VBR 0, assumed 0; a JMP.L is followed), and the real
+// INTENAR / INTREQR, to compare with our shadow of the interrupt enables
+uint32_t remote_diag_l2_vector = 0, remote_diag_l2_target = 0;
+uint8_t remote_diag_l2_buf[CODE_DUMP_SIZE];
+uint16_t remote_diag_real_intenar = 0, remote_diag_real_intreqr = 0;
 #define INTENA_LOG_SIZE 8
 struct intena_log_entry { uint8_t type; uint16_t addr_lo; uint32_t val; };
 struct intena_log_entry remote_diag_intena_log[INTENA_LOG_SIZE];
@@ -334,6 +339,14 @@ cpu_loop:
   if (__atomic_load_n(&remote_diag_dump_req, __ATOMIC_ACQUIRE)) {
     for (int i = 0; i < CODE_DUMP_SIZE; i++)
       remote_diag_dump_buf[i] = (uint8_t)m68k_read_memory_8(remote_diag_dump_addr + i);
+    remote_diag_l2_vector = m68k_read_memory_32(0x68);
+    remote_diag_l2_target = remote_diag_l2_vector;
+    if (m68k_read_memory_16(remote_diag_l2_target) == 0x4ef9)
+      remote_diag_l2_target = m68k_read_memory_32(remote_diag_l2_target + 2);
+    for (int i = 0; i < CODE_DUMP_SIZE; i++)
+      remote_diag_l2_buf[i] = (uint8_t)m68k_read_memory_8(remote_diag_l2_target + i);
+    remote_diag_real_intenar = (uint16_t)ps_read_16(INTENAR);
+    remote_diag_real_intreqr = (uint16_t)ps_read_16(INTREQR);
     __atomic_store_n(&remote_diag_dump_req, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&remote_diag_dump_done, 1, __ATOMIC_RELEASE);
   }

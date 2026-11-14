@@ -47,6 +47,9 @@ extern uint32_t remote_diag_intena_count;
 extern uint32_t remote_diag_dump_addr;
 extern int remote_diag_dump_req, remote_diag_dump_done;
 extern uint8_t remote_diag_dump_buf[CODE_DUMP_SIZE];
+extern uint32_t remote_diag_l2_vector, remote_diag_l2_target;
+extern uint8_t remote_diag_l2_buf[CODE_DUMP_SIZE];
+extern uint16_t remote_diag_real_intenar, remote_diag_real_intreqr;
 
 // Where the CPU spends the stuck window: PC/SR sampled from this thread (racy but good enough for a histogram), and
 // the memory around the most frequent PC, copied by the CPU thread.
@@ -105,6 +108,15 @@ static void print_code_dump(void) {
     printf("[REMOTE]   %08x:", dump_base + i);
     for (int k = 0; k < 16; k += 2)
       printf(" %02x%02x", remote_diag_dump_buf[i + k], remote_diag_dump_buf[i + k + 1]);
+    printf("\n");
+  }
+  printf("[REMOTE]   real INTENAR=%04x INTREQR=%04x | our shadow: INTEN=%u PORTS=%u | level 2 vector=%08x -> %08x:\n",
+         (unsigned)remote_diag_real_intenar, (unsigned)remote_diag_real_intreqr, (unsigned)ipl_enabled[7],
+         (unsigned)ipl_enabled[2], (unsigned)remote_diag_l2_vector, (unsigned)remote_diag_l2_target);
+  for (int i = 0; i < CODE_DUMP_SIZE; i += 16) {
+    printf("[REMOTE]   %08x:", remote_diag_l2_target + i);
+    for (int k = 0; k < 16; k += 2)
+      printf(" %02x%02x", remote_diag_l2_buf[i + k], remote_diag_l2_buf[i + k + 1]);
     printf("\n");
   }
 }
