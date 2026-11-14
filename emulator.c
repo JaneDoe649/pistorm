@@ -137,7 +137,9 @@ void *ipl_task(void *args) {
     if (value & (1 << PIN_TXN_IN_PROGRESS))
       goto noppers;
 
-    if (!(value & (1 << PIN_IPL_ZERO)) || ipl_enabled[amiga_emulated_ipl()]) {
+    // An emulated interrupt is only raised when the master enable (INTENA bit 14) and its level are enabled,
+    // like the real chipset: otherwise exec's level 2 handler sees INTEN off, does an RTE and is re-entered forever.
+    if (!(value & (1 << PIN_IPL_ZERO)) || (ipl_enabled[7] && ipl_enabled[amiga_emulated_ipl()])) {
       old_irq = irq_delay;
       //NOP
       if (!irq) {
@@ -911,9 +913,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           if (val & 0x2000) {
             ipl_enabled[6] = enable;
           }
-          if (val & 0x4000) {
-            ipl_enabled[7] = enable;
-          }
+          ipl_enabled[7] = (val & 0x4000) ? 1 : 0; // INTENAR is the real state: resync the master enable
           //printf("Interrupts enabled: M:%d 0-6:%d%d%d%d%d%d\n", ipl_enabled[7], ipl_enabled[6], ipl_enabled[5], ipl_enabled[4], ipl_enabled[3], ipl_enabled[2], ipl_enabled[1]);
           *res = rres;
           return 1;
@@ -1148,8 +1148,8 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           if (val & 0x2000) {
             ipl_enabled[6] = enable;
           }
-          if (val & 0x4000 && enable) {
-            ipl_enabled[7] = 1;
+          if (val & 0x4000) {
+            ipl_enabled[7] = enable; // Disable() clears INTEN: stop raising the emulated PORTS
           }
           //printf("Interrupts enabled: M:%d 0-6:%d%d%d%d%d%d\n", ipl_enabled[7], ipl_enabled[6], ipl_enabled[5], ipl_enabled[4], ipl_enabled[3], ipl_enabled[2], ipl_enabled[1]);
           return 0;
