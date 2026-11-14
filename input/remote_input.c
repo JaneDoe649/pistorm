@@ -35,6 +35,7 @@ extern uint32_t last_last_irq;
 extern uint8_t ipl_enabled[8];
 extern uint32_t remote_diag_icr, remote_diag_dat, remote_diag_intreq; // emulator.c
 extern uint32_t remote_diag_joydat[2][3], remote_diag_pra;
+extern int32_t remote_diag_pra_type, remote_diag_pra_fire, remote_diag_ddra, remote_diag_potgo;
 
 #define LINE_MAX_LEN 128
 // how often the thread wakes up to retry queued releases / re-raise the keyboard interrupt
@@ -127,6 +128,10 @@ static void watch_joystick_reads(void) {
   memcpy(prev, cur, sizeof(cur));
   printf("[REMOTE] joystick reads: JOY0DAT b=%u w=%u l=%u | JOY1DAT b=%u w=%u l=%u | CIAAPRA=%u\n", cur[0], cur[1], cur[2],
          cur[3], cur[4], cur[5], cur[6]);
+  printf("[REMOTE]   CIAAPRA last width=%d (0 byte, 1 word, 2 long) value shown with fire down=0x%02x | "
+         "last DDRA write=0x%02x last POTGO write=0x%04x (-1: none)\n",
+         (int)remote_diag_pra_type, (unsigned)remote_diag_pra_fire & 0xFFFFFFFFu, (unsigned)remote_diag_ddra,
+         (unsigned)remote_diag_potgo);
 }
 
 // Diagnostics: a key that stays down on our side for a while means the client's release is late or lost

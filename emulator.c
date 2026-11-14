@@ -53,6 +53,9 @@ int remote_kb_active = 0;
 uint32_t remote_diag_icr = 0, remote_diag_dat = 0, remote_diag_intreq = 0;
 // reads of JOY0DAT/JOY1DAT while the remote joystick is active, by access width (byte, word, longword), and of CIAAPRA
 uint32_t remote_diag_joydat[2][3], remote_diag_pra = 0;
+// last CIAAPRA access width and value presented while the remote joystick fire is down; last writes to CIA-A DDRA
+// (a game that makes bit 7 an output reads its own latch there) and to POTGO. -1: never seen.
+int32_t remote_diag_pra_type = -1, remote_diag_pra_fire = -1, remote_diag_ddra = -1, remote_diag_potgo = -1;
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -811,16 +814,20 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return amiga_handle_intrqr_read(res);
           break;
         case CIAAPRA: {
-          if (remote_joystick_present())
+          if (remote_joystick_present()) {
             __atomic_fetch_add(&remote_diag_pra, 1, __ATOMIC_RELAXED);
+            remote_diag_pra_type = (int32_t)type;
+          }
           uint8_t rfire = remote_joystick_present() ? (remote_joystick_mask() & 0x10) : 0;
           if ((remote_mouse_buttons() & 0x01) || rfire) {
             // remote left button pulls FIR0 (bit 6) low, remote joystick fire pulls FIR1 (bit 7) low
             rres = (uint32_t)ps_read(type, addr);
             if (remote_mouse_buttons() & 0x01)
               rres &= ~0x40u;
-            if (rfire)
+            if (rfire) {
               rres &= ~0x80u;
+              remote_diag_pra_fire = (int32_t)(rres & 0xFF);
+            }
             if (swap_df0_with_dfx && spoof_df0_id)
               rres &= 0xDF;
             *res = rres;
@@ -1131,6 +1138,14 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           return 0;
           break;
         }
+        case CIAAPRA + 0x200: // CIA-A DDRA
+          remote_diag_ddra = (int32_t)(val & 0xFF);
+          return 0;
+          break;
+        case 0xDFF034: // POTGO
+          remote_diag_potgo = (int32_t)(val & 0xFFFF);
+          return 0;
+          break;
         case CIAAPRA:
           if (ovl != (val & (1 << 0))) {
             ovl = (val & (1 << 0));
