@@ -160,6 +160,10 @@ PiStorm hands back to the emulated 68000 when it reads these registers, nothing 
 `mac_client.py --no-gamepad` turns it off. Generic gamepads report their elements differently, so a model may need
 adjusting in `tools/remote-input/gamepad.py`.
 
+### Diagnostics
+
+`make REMOTE_DIAG=1 PLATFORM=...` builds verbose diagnostics for the remote input (CIAADAT and joystick access logs, stuck key queue report with CPU sampling, see `input/remote_diag.h`); a normal `make` leaves them out. Switching the option rebuilds the few objects that depend on it.
+
 ## PiStorm Remote, the macOS application
 
 `tools/remote-input/` also contains a small windowed version of the client, launched from the Finder. It shows the
