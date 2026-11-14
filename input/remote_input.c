@@ -160,8 +160,10 @@ static void handle_line(char *line) {
       }
       break;
     case 'P':
+      // MSG_NOSIGNAL: a client that already went away must not kill the emulator with SIGPIPE; the failure is ignored,
+      // the next read reports the closed connection and the client is dropped there
       if (client_fd != -1)
-        (void)!write(client_fd, "PONG\n", 5);
+        (void)!send(client_fd, "PONG\n", 5, MSG_NOSIGNAL);
       break;
     default:
       break;
