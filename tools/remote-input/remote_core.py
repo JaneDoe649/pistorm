@@ -377,11 +377,15 @@ class Capture:
     Hotkeys, always active: Control+Option+G toggles the grab, Control+Option+Q calls on_quit.
     """
 
-    def __init__(self, link, on_grab_changed=None, on_quit=None):
+    def __init__(self, link, on_grab_changed=None, on_quit=None, on_before_grab=None):
         self.link = link
         self.on_grab_changed = on_grab_changed
         self.on_quit = on_quit
+        # called just before the pointer is hidden: macOS only hides it for the frontmost application, so a GUI
+        # client uses this to bring itself to the front (the hotkey can be pressed while another application is active)
+        self.on_before_grab = on_before_grab
         self.grabbed = False
+        self._cursor_hidden = False  # CGDisplayHideCursor / ShowCursor are counted: keep them balanced
         self.pad_mask = 0
         self._tap = None
         self._source = None
@@ -431,13 +435,19 @@ class Capture:
             return
         self.grabbed = on
         if on:
+            if self.on_before_grab:
+                self.on_before_grab()
             Q.CGAssociateMouseAndMouseCursorPosition(False)
-            Q.CGDisplayHideCursor(Q.CGMainDisplayID())
+            if not self._cursor_hidden:
+                Q.CGDisplayHideCursor(Q.CGMainDisplayID())
+                self._cursor_hidden = True
             self.link.set_joystick(self.pad_mask)
         else:
             self.link.release_all()
             Q.CGAssociateMouseAndMouseCursorPosition(True)
-            Q.CGDisplayShowCursor(Q.CGMainDisplayID())
+            if self._cursor_hidden:
+                Q.CGDisplayShowCursor(Q.CGMainDisplayID())
+                self._cursor_hidden = False
         if self.on_grab_changed:
             self.on_grab_changed(on)
 

@@ -19,12 +19,15 @@ from PyObjCTools import AppHelper
 import gamepad
 import remote_core as core
 
-WIN_W, WIN_H = 380, 384
+WIN_W, WIN_H = 380, 410
 LABEL_X, LABEL_W = 20, 110
 FIELD_X, FIELD_W = 140, 220
 
 # states
 IDLE, CONNECTING, CONNECTED, CAPTURING, ERROR = "idle", "connecting", "connected", "capturing", "error"
+
+CONNECTED_TEXT = "Connecté, capture inactive. Ctrl+Option+G pour capturer"
+HOTKEYS_TEXT = "Ctrl+Option+G : capturer / libérer · +Q : déconnecter"
 
 DOT_COLORS = {
     IDLE: NSColor.systemGrayColor,
@@ -138,7 +141,8 @@ class Controller:
             return
         self.link = link
         self.capture = core.Capture(link, on_grab_changed=self._grab_changed,
-                                    on_quit=lambda: AppHelper.callAfter(self.disconnect))
+                                    on_quit=lambda: AppHelper.callAfter(self.disconnect),
+                                    on_before_grab=self.view.bring_to_front)
         self.capture.pad_mask = self.pad_mask
         try:
             self.capture.install()
@@ -146,7 +150,7 @@ class Controller:
             self._teardown()
             self._set(ERROR, str(e))
             return
-        self._set(CONNECTED, "Connecté, capture inactive")
+        self._set(CONNECTED, CONNECTED_TEXT)
         if self.settings.auto_capture:
             self.view.release_focus()  # an active password field would block the keyboard capture
             self.capture.set_grab(True)
@@ -157,7 +161,7 @@ class Controller:
             if on:
                 self._set(CAPTURING, "Capture active. Ctrl+Option+G pour libérer")
             else:
-                self._set(CONNECTED, "Connecté, capture inactive")
+                self._set(CONNECTED, CONNECTED_TEXT)
 
     def _lost(self, gen, why):
         if gen != self._gen:
@@ -281,6 +285,11 @@ class MainWindow:
         self.pad_label.setFont_(NSFont.systemFontOfSize_(12))
         self.pad_label.setTextColor_(NSColor.secondaryLabelColor())
 
+        # the hotkeys are the only way out of a capture, so they are shown before the first one; dimmed while unusable
+        self.hint = self._label(HOTKEYS_TEXT, LABEL_X, 122, WIN_W - 40)
+        self.hint.setFont_(NSFont.systemFontOfSize_(11))
+        self.grab_b.setToolTip_("Ctrl+Option+G capture ou libère le clavier et la souris")
+
         self.dot = self._label("●", 20, 22, 22, 28)
         self.dot.setFont_(NSFont.systemFontOfSize_(22))
         self.status = self._label("", 46, 8, WIN_W - 66, 50)
@@ -375,6 +384,9 @@ class MainWindow:
         self._persist(s, password)
         self.controller.connect(s, password or None)
 
+    def bring_to_front(self):
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+
     def release_focus(self):
         # leaving the secure password field matters: while it is being edited, macOS blocks event taps
         self.win.makeFirstResponder_(None)
@@ -405,7 +417,9 @@ class MainWindow:
         self.auto_b.setEnabled_(editable)
         self.connect_b.setTitle_({CONNECTING: "Annuler", CONNECTED: "Déconnecter",
                                   CAPTURING: "Déconnecter"}.get(state, "Connecter"))
-        self.grab_b.setEnabled_(state in (CONNECTED, CAPTURING))
+        usable = state in (CONNECTED, CAPTURING)
+        self.hint.setTextColor_(NSColor.secondaryLabelColor() if usable else NSColor.tertiaryLabelColor())
+        self.grab_b.setEnabled_(usable)
         self.grab_b.setTitle_("Libérer" if state == CAPTURING else "Capturer")
         self.win.setTitle_("PiStorm Remote, capture active" if state == CAPTURING else "PiStorm Remote")
 
