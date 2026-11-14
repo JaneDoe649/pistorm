@@ -837,6 +837,15 @@ static inline uint32_t cia_a_canonical(uint8_t type, uint32_t addr) {
   return addr;
 }
 
+// May a read of CIAAICR/CIAADAT present the next queued remote key? Yes when the emulated PORTS interrupt is pending,
+// but also when a key is merely waiting: a game that polls the keyboard with its interrupts masked (Battle Squadron
+// runs with SR=$2700) never takes the interrupt, and clears INTREQ blindly in its main loop, which drops our pending
+// bit thousands of times a second. Tying the latch to that bit delivered a key only when a poll happened to fall in
+// the few microseconds the bit was set, i.e. seconds late.
+static inline int kb_may_latch(void) {
+  return amiga_emulating_irq(PORTS) || kb_irq_wanted();
+}
+
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
   switch (cfg->platform->id) {
     case PLATFORM_AMIGA:
@@ -886,7 +895,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           // The keyboard byte is reported through the SP flag (0x88 = IR + SP), together with whatever the real
           // CIA reports (timers, TOD...): replacing the register would hide those and leave the CIA interrupt
           // line asserted. Reading the ICR clears the flag, as on the real chip.
-          if ((kb_hook_enabled || remote_kb_active) && kb_icr_sp_take(amiga_emulating_irq(PORTS))) {
+          if ((kb_hook_enabled || remote_kb_active) && kb_icr_sp_take(kb_may_latch())) {
             __atomic_fetch_add(&remote_diag_icr, 1, __ATOMIC_RELAXED);
             rres = (uint32_t)ps_read(type, addr);
             *res = rres | 0x88;
@@ -899,7 +908,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           // interrupt) and returns the same key until the keyboard handshake, see kb_sdr_read().
           if (kb_hook_enabled || remote_kb_active) {
             uint8_t c = 0, t = 0;
-            int kind = kb_sdr_read(amiga_emulating_irq(PORTS), &c, &t);
+            int kind = kb_sdr_read(kb_may_latch(), &c, &t);
             if (kind) {
               __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
               if (remote_kb_active)
