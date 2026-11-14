@@ -56,6 +56,27 @@ uint32_t remote_diag_joydat[2][3], remote_diag_pra = 0;
 // last CIAAPRA access width and value presented while the remote joystick fire is down; last writes to CIA-A DDRA
 // (a game that makes bit 7 an output reads its own latch there) and to POTGO. -1: never seen.
 int32_t remote_diag_pra_type = -1, remote_diag_pra_fire = -1, remote_diag_ddra = -1, remote_diag_potgo = -1;
+// every CIA / custom register read (address, width) while the remote joystick fire is down, to see which one a game
+// really uses to read the button. Filled by the CPU thread, printed and cleared by the remote input thread.
+#define FIRE_CENSUS_SIZE 64
+struct fire_census_entry { uint32_t addr, count; uint8_t type; };
+struct fire_census_entry remote_diag_fire_census[FIRE_CENSUS_SIZE];
+
+static void fire_census_hit(uint8_t type, uint32_t addr) {
+  for (int i = 0; i < FIRE_CENSUS_SIZE; i++) {
+    struct fire_census_entry *e = &remote_diag_fire_census[i];
+    if (e->count && e->addr == addr && e->type == type) {
+      __atomic_fetch_add(&e->count, 1, __ATOMIC_RELAXED);
+      return;
+    }
+    if (!e->count) {
+      e->addr = addr;
+      e->type = type;
+      __atomic_store_n(&e->count, 1, __ATOMIC_RELEASE);
+      return;
+    }
+  }
+}
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -809,6 +830,9 @@ static inline void ps_write(uint8_t type, uint32_t addr, uint32_t val) {
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
   switch (cfg->platform->id) {
     case PLATFORM_AMIGA:
+      if ((remote_joystick_mask() & 0x10) && remote_joystick_present() &&
+          ((addr >> 16) == 0xBF || (addr & 0xFFFE00) == 0xDFF000))
+        fire_census_hit(type, addr);
       switch (addr) {
         case INTREQR:
           return amiga_handle_intrqr_read(res);

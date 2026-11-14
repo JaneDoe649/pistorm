@@ -36,6 +36,23 @@ extern uint8_t ipl_enabled[8];
 extern uint32_t remote_diag_icr, remote_diag_dat, remote_diag_intreq; // emulator.c
 extern uint32_t remote_diag_joydat[2][3], remote_diag_pra;
 extern int32_t remote_diag_pra_type, remote_diag_pra_fire, remote_diag_ddra, remote_diag_potgo;
+#define FIRE_CENSUS_SIZE 64
+struct fire_census_entry { uint32_t addr, count; uint8_t type; };
+extern struct fire_census_entry remote_diag_fire_census[FIRE_CENSUS_SIZE];
+
+// Registers read by the Amiga while the joystick fire was down, printed when the fire is released
+static void print_fire_census(void) {
+  static const char *const widths[] = {"byte", "word", "long"};
+  printf("[REMOTE] registers read while fire was down:\n");
+  for (int i = 0; i < FIRE_CENSUS_SIZE; i++) {
+    struct fire_census_entry *e = &remote_diag_fire_census[i];
+    uint32_t n = __atomic_load_n(&e->count, __ATOMIC_ACQUIRE);
+    if (!n)
+      break;
+    printf("[REMOTE]   0x%06x %-4s x%u\n", (unsigned)e->addr, e->type < 3 ? widths[e->type] : "?", (unsigned)n);
+    __atomic_store_n(&e->count, 0, __ATOMIC_RELAXED);
+  }
+}
 
 #define LINE_MAX_LEN 128
 // how often the thread wakes up to retry queued releases / re-raise the keyboard interrupt
@@ -267,7 +284,12 @@ static void handle_line(char *line) {
       break;
     case 'J':
       if (sscanf(line + 1, "%d", &a) == 1) {
+        static int fire_was_down = 0;
+        int fire_down = (a & 0x10) != 0;
         inject_joystick((uint8_t)a);
+        if (fire_was_down && !fire_down)
+          print_fire_census();
+        fire_was_down = fire_down;
         printf("[REMOTE] joystick mask %d (1 up, 2 down, 4 left, 8 right, 16 fire, 32 button 2)\n", a & 0x3F);
       }
       break;
