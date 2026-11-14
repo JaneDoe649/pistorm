@@ -58,6 +58,11 @@ uint32_t remote_diag_joydat[2][3], remote_diag_pra = 0;
 int32_t remote_diag_pra_type = -1, remote_diag_pra_fire = -1, remote_diag_ddra = -1, remote_diag_potgo = -1;
 // every CIA / custom register read (address, width) while the remote joystick fire is down, to see which one a game
 // really uses to read the button. Filled by the CPU thread, printed and cleared by the remote input thread.
+// last writes to INTENA (width and value as seen by the hook): our shadow of the master enable is rebuilt from them
+#define INTENA_LOG_SIZE 8
+struct intena_log_entry { uint8_t type; uint16_t addr_lo; uint32_t val; };
+struct intena_log_entry remote_diag_intena_log[INTENA_LOG_SIZE];
+uint32_t remote_diag_intena_count = 0;
 #define FIRE_CENSUS_SIZE 64
 struct fire_census_entry { uint32_t addr, count; uint8_t type; };
 struct fire_census_entry remote_diag_fire_census[FIRE_CENSUS_SIZE];
@@ -1220,6 +1225,11 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           break;
         }
         case INTENA: {
+          {
+            uint32_t n = remote_diag_intena_count;
+            remote_diag_intena_log[n % INTENA_LOG_SIZE] = (struct intena_log_entry){type, (uint16_t)(addr & 0xFFFF), val};
+            __atomic_store_n(&remote_diag_intena_count, n + 1, __ATOMIC_RELEASE);
+          }
           // This code is kind of strange and should probably be reworked/revoked.
           uint8_t enable = 1;
           if (!(val & 0x8000))

@@ -39,6 +39,10 @@ extern int32_t remote_diag_pra_type, remote_diag_pra_fire, remote_diag_ddra, rem
 #define FIRE_CENSUS_SIZE 64
 struct fire_census_entry { uint32_t addr, count; uint8_t type; };
 extern struct fire_census_entry remote_diag_fire_census[FIRE_CENSUS_SIZE];
+#define INTENA_LOG_SIZE 8
+struct intena_log_entry { uint8_t type; uint16_t addr_lo; uint32_t val; };
+extern struct intena_log_entry remote_diag_intena_log[INTENA_LOG_SIZE];
+extern uint32_t remote_diag_intena_count;
 
 // Registers read by the Amiga while the joystick fire was down, printed when the fire is released
 static void print_fire_census(void) {
@@ -199,6 +203,15 @@ static void watch_queue(void) {
            (unsigned)(__atomic_load_n(&remote_diag_intreq, __ATOMIC_RELAXED) - snap_intreq),
            (unsigned)last_last_irq, (unsigned)ipl_enabled[2],
            m68k_get_reg(NULL, M68K_REG_SR), m68k_get_reg(NULL, M68K_REG_PC));
+    // our shadow of INTENA: master enable (bit 14) and the last writes the hook saw, newest first
+    printf("[REMOTE]   INTEN master=%u, %u INTENA writes, last:", (unsigned)ipl_enabled[7],
+           (unsigned)__atomic_load_n(&remote_diag_intena_count, __ATOMIC_ACQUIRE));
+    uint32_t cnt = __atomic_load_n(&remote_diag_intena_count, __ATOMIC_ACQUIRE);
+    for (uint32_t k = 0; k < 6 && k < cnt; k++) {
+      struct intena_log_entry *e = &remote_diag_intena_log[(cnt - 1 - k) % INTENA_LOG_SIZE];
+      printf(" %s@%04x=0x%08x", e->type == 0 ? "b" : (e->type == 1 ? "w" : "l"), (unsigned)e->addr_lo, (unsigned)e->val);
+    }
+    printf("\n");
   }
 }
 
