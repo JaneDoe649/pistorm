@@ -56,6 +56,10 @@ else
 	LFLAGS    = $(WARNINGS) -L/opt/vc/lib -L./raylib -lraylib -lbrcmGLESv2 -lbrcmEGL -lbcm_host -lstdc++ -lvcos -lvchiq_arm -lasound
 endif
 
+# Generate .d dependency files next to the objects: the -include at the end of this file reads them, so editing a
+# header (emulator.h, input/input.h, m68kconf.h...) rebuilds only the sources that include it.
+CFLAGS   += -MMD -MP
+
 TARGET = $(EXENAME)$(EXE)
 
 DELETEFILES = $(MUSASHIGENCFILES) $(MUSASHIGENHFILES) $(.OFILES) $(.OFILES:%.o=%.d) $(TARGET) $(MUSASHIGENERATOR)$(EXE)
@@ -75,7 +79,7 @@ buptest: buptest.c gpio/ps_protocol.c
 a314/a314.o: a314/a314.cc a314/a314.h
 	$(CXX) -MMD -MP -c -o a314/a314.o -O3 a314/a314.cc -march=armv8-a -mfloat-abi=hard -mfpu=neon-fp-armv8 -O3 -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -I. -I..
 
-$(MUSASHIGENCFILES) $(MUSASHIGENHFILES): $(MUSASHIGENERATOR)$(EXE)
+$(MUSASHIGENCFILES) $(MUSASHIGENHFILES): $(MUSASHIGENERATOR)$(EXE) m68k_in.c
 	$(EXEPATH)$(MUSASHIGENERATOR)$(EXE)
 
 $(MUSASHIGENERATOR)$(EXE):  $(MUSASHIGENERATOR).c
