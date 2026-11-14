@@ -34,6 +34,7 @@ extern uint16_t emulated_irqs; // platforms/amiga/amiga-interrupts.c
 extern uint32_t last_last_irq;
 extern uint8_t ipl_enabled[8];
 extern uint32_t remote_diag_icr, remote_diag_dat, remote_diag_intreq; // emulator.c
+extern uint32_t remote_diag_joydat[2][3], remote_diag_pra;
 
 #define LINE_MAX_LEN 128
 // how often the thread wakes up to retry queued releases / re-raise the keyboard interrupt
@@ -106,6 +107,26 @@ static void print_dat_log(void) {
            e->key, e->event, e->icr, e->dat, e->acks, e->timeouts);
     dat_log_printed++;
   }
+}
+
+// Diagnostics: how the game reads the joystick registers (width of the accesses) while the remote joystick is active,
+// printed when the counters changed, at most once a second.
+static void watch_joystick_reads(void) {
+  static int64_t last = 0;
+  static uint32_t prev[7];
+  int64_t now = now_msec();
+  if (now - last < 1000)
+    return;
+  uint32_t cur[7];
+  for (int i = 0; i < 6; i++)
+    cur[i] = __atomic_load_n(&remote_diag_joydat[i / 3][i % 3], __ATOMIC_RELAXED);
+  cur[6] = __atomic_load_n(&remote_diag_pra, __ATOMIC_RELAXED);
+  if (!memcmp(cur, prev, sizeof(cur)))
+    return;
+  last = now;
+  memcpy(prev, cur, sizeof(cur));
+  printf("[REMOTE] joystick reads: JOY0DAT b=%u w=%u l=%u | JOY1DAT b=%u w=%u l=%u | CIAAPRA=%u\n", cur[0], cur[1], cur[2],
+         cur[3], cur[4], cur[5], cur[6]);
 }
 
 // Diagnostics: a key that stays down on our side for a while means the client's release is late or lost
@@ -240,8 +261,10 @@ static void handle_line(char *line) {
         inject_mouse_buttons((uint8_t)a);
       break;
     case 'J':
-      if (sscanf(line + 1, "%d", &a) == 1)
+      if (sscanf(line + 1, "%d", &a) == 1) {
         inject_joystick((uint8_t)a);
+        printf("[REMOTE] joystick mask %d (1 up, 2 down, 4 left, 8 right, 16 fire, 32 button 2)\n", a & 0x3F);
+      }
       break;
     case 'W':
       // newmouse wheel up/down are the pseudo keys 0xfe/0xff in keymap_amiga, press only (as for the local mouse)
@@ -369,6 +392,7 @@ static void *remote_task(void *arg) {
     flush_pending_releases();
     watch_queue();
     watch_held_keys();
+    watch_joystick_reads();
     print_dat_log();
     if (kb_irq_wanted())
       kick_keyboard_irq();

@@ -51,6 +51,8 @@ int kb_hook_enabled = 0;
 int remote_kb_active = 0;
 // freeze diagnostics, read by remote_input.c (relaxed counters, only touched on the hooked accesses)
 uint32_t remote_diag_icr = 0, remote_diag_dat = 0, remote_diag_intreq = 0;
+// reads of JOY0DAT/JOY1DAT while the remote joystick is active, by access width (byte, word, longword), and of CIAAPRA
+uint32_t remote_diag_joydat[2][3], remote_diag_pra = 0;
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -809,6 +811,8 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return amiga_handle_intrqr_read(res);
           break;
         case CIAAPRA: {
+          if (remote_joystick_present())
+            __atomic_fetch_add(&remote_diag_pra, 1, __ATOMIC_RELAXED);
           uint8_t rfire = remote_joystick_present() ? (remote_joystick_mask() & 0x10) : 0;
           if ((remote_mouse_buttons() & 0x01) || rfire) {
             // remote left button pulls FIR0 (bit 6) low, remote joystick fire pulls FIR1 (bit 7) low
@@ -869,6 +873,13 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return 0;
           break;
         case JOY0DAT:
+          if (remote_joystick_present() && type <= OP_TYPE_LONGWORD)
+            __atomic_fetch_add(&remote_diag_joydat[0][type], 1, __ATOMIC_RELAXED);
+          if (type == OP_TYPE_LONGWORD && remote_joystick_present() && !mouse_hook_enabled) {
+            // one 32 bit read gets JOY0DAT and JOY1DAT: keep the real port 1, replace the port 2 half
+            *res = ((uint32_t)ps_read(type, addr) & 0xFFFF0000u) | remote_joystick_dat();
+            return 1;
+          }
           if (mouse_hook_enabled) {
             // Pi mouse replaces the Amiga one; the remote offset is added on top
             unsigned short result = ((uint8_t)(mouse_dy + remote_mouse_y) << 8) | (uint8_t)(mouse_dx + remote_mouse_x);
@@ -884,8 +895,19 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           return 0;
           break;
         case JOY1DAT:
+        case JOY1DAT + 1: // low byte, for games that read the two counters with byte accesses
           if (remote_joystick_present()) {
-            *res = remote_joystick_dat();
+            if (type <= OP_TYPE_LONGWORD)
+              __atomic_fetch_add(&remote_diag_joydat[1][type], 1, __ATOMIC_RELAXED);
+            uint16_t v = remote_joystick_dat();
+            if (type == OP_TYPE_BYTE)
+              *res = (addr & 1) ? (v & 0xFF) : (v >> 8); // the result is the byte at that address, not the word
+            else if ((addr & 1) || type == OP_TYPE_MEM)
+              return 0;
+            else if (type == OP_TYPE_LONGWORD)
+              *res = (uint32_t)v << 16; // JOY1DAT followed by JOYTEST, which is write only
+            else
+              *res = v;
             return 1;
           }
           return 0;
