@@ -41,10 +41,12 @@ inline int amiga_handle_intrqr_read(uint32_t *res) {
   return 0;
 }
 
+// INTREQ clear write: drop the acknowledged bits from the emulated interrupts. Returns 0 so that the write still goes to
+// the chipset unchanged: the emulated bit may be shared with a real source (PORTS is also the CIA-A interrupt), whose
+// latch in the real INTREQ has to be cleared by the same acknowledge, and clearing a bit that is not set does nothing.
 int amiga_handle_intrq_write(uint32_t val) {
   if (emulated_irqs && !(val & 0x8000)) {
     uint16_t previous_emulated_irqs = emulated_irqs;
-    uint16_t hardware_irqs_to_clear = val & ~emulated_irqs;
     emulated_irqs &= ~val;
     if (previous_emulated_irqs != emulated_irqs) {
       emulated_ipl = 0;
@@ -54,10 +56,6 @@ int amiga_handle_intrq_write(uint32_t val) {
         }
       }
     }
-    if (hardware_irqs_to_clear) {
-      ps_write_16(INTREQ, hardware_irqs_to_clear);
-    }
-    return 1;
   }
   return 0;
 }

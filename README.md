@@ -92,6 +92,98 @@ To exit the emulator you can press `Ctrl+C` (on the keyboard or over SSH) or pre
 
 For Amiga, there is currently no Gayle or IDE controller emulation available, but PiSCSI can now autoboot RDB/RDSK hard drive images (and physical drives), with Kickstart 2.0 and up. Check out the readme in `platforms/amiga/piscsi` for more detailed information.
 
+# Remote keyboard and mouse control (SSH)
+
+The emulator can accept keyboard and mouse events from another machine, for example a Mac, while the physical
+inputs keep working (the two sources are merged).
+
+1. Add this line to your `.cfg` file (Amiga platform only). The port is only opened on `127.0.0.1`, so nothing is exposed on the network:
+
+   ```
+   remoteinput 7777
+   ```
+
+2. On the Mac, install the dependency and run the client. It opens the SSH tunnel for you and grabs the keyboard and mouse:
+
+   ```
+   pip3 install pyobjc-framework-Quartz
+   ./tools/remote-input/mac_client.py --ssh pi@raspberrypi.local
+   ```
+
+   macOS asks for the *Input Monitoring* and *Accessibility* permissions for your terminal app on first use.
+   `Control+Option+G` releases or re-grabs the inputs, `Control+Option+Q` quits. The Mac Command keys are the Amiga keys.
+
+The protocol is line based and can be driven by hand through the tunnel (`nc 127.0.0.1 7777`), see `input/remote_input.h`:
+`K <linux key code> <1|0>`, `M <dx> <dy>`, `B <button mask>`, `J <joystick mask>`, `P`. The mouse wheel is not forwarded.
+A client that disconnects has all its keys, buttons and joystick directions released automatically. The Amiga key queue holds 255 events,
+so clients should avoid sending key bursts faster than a few hundred events per second.
+
+### Key mapping
+
+The client sends physical key positions, so the layout of the Mac keyboard does not matter. The letters, digits and
+punctuation keys land on the Amiga key at the same position (the extra ISO key next to the left Shift is the Amiga
+`<>` key). The other keys:
+
+| Mac key | Amiga key | Remark |
+|---|---|---|
+| Left / Right Command | Left / Right Amiga | |
+| Left / Right Option | Left / Right Alt | |
+| Left or Right Control | Ctrl | there is a single Amiga Ctrl |
+| Shift, Caps Lock | Shift, Caps Lock | Caps Lock is a latching key on the Amiga too |
+| Return, Tab, Space, Escape | Return, Tab, Space, Esc | |
+| Delete (backspace) | Backspace | |
+| Forward Delete | Del | |
+| **Home** (`Fn+←` on a laptop) | **Help** | the only Mac key that gives Help |
+| Page Up | Keypad `(` | |
+| F1 to F10 | F1 to F10 | F10 is the default WHDload quit key |
+| Arrow keys | Cursor keys | |
+| Keypad `0`-`9`, `.`, `+`, `-`, `/`, Enter | same Amiga keypad keys | |
+| **Keypad `*`** | **Keypad `*`** | Amiga raw key `$5D`, the "PrtScr" quit key of some WHDload slaves (Battle Squadron) |
+
+No Amiga key is sent for **F11, F12, End, Page Down**, the **Help/Insert** key of extended Mac keyboards, F13 and above, nor
+the other keys not listed here. The table is `MAC_TO_LINUX` in `tools/remote-input/remote_core.py` (Mac virtual key
+code to Linux key code) followed by `keymap_amiga` in `input/input.c` (Linux key code to Amiga raw key).
+
+WHDload quits on the key set by the slave, or by its `QuitKey=` tooltype (Deluxe Galaga: F10, Battle Squadron: keypad
+`*`). A Mac keyboard without a numeric keypad cannot type the keypad `*`: for such a slave, set `QuitKey=` to a key from
+the table above. Home gives Help for slaves that quit on Help.
+
+### USB gamepad on Amiga port 2
+
+USB gamepads plugged into the Mac (any HID joystick or gamepad, read through IOHIDManager) are presented as a digital
+joystick on the Amiga **port 2**, while the keyboard and mouse are grabbed. The hat switch and the left stick move,
+button 1 is fire and button 2 is the second button. The mouse stays on port 1. Releasing the capture releases the
+gamepad too. `J <mask>` is the protocol line: 1 up, 2 down, 4 left, 8 right, 16 fire, 32 second button, 0 = idle.
+While a direction or button is pressed it replaces port 2 (`JOY1DAT`, fire on `CIAAPRA` bit 7, second button on
+`POTGOR` bit 14); when idle the real port 2 is read, so a real joystick still works. This only changes the values
+PiStorm hands back to the emulated 68000 when it reads these registers, nothing is driven on the Amiga's ports.
+`mac_client.py --no-gamepad` turns it off. Generic gamepads report their elements differently, so a model may need
+adjusting in `tools/remote-input/gamepad.py`.
+
+### Diagnostics
+
+`make REMOTE_DIAG=1 PLATFORM=...` builds verbose diagnostics for the remote input (CIAADAT and joystick access logs, stuck key queue report with CPU sampling, see `input/remote_diag.h`); a normal `make` leaves them out. Switching the option rebuilds the few objects that depend on it.
+
+## PiStorm Remote, the macOS application
+
+`tools/remote-input/` also contains a small windowed version of the client, launched from the Finder. It shows the
+connection status (grey: disconnected, orange: connecting, blue: connected, green: capturing, red: error), keeps the
+host, user and ports between launches, and stores the SSH password in the macOS Keychain, never in a file.
+
+Build it once on the Mac (needs Xcode command line tools, which provide `python3`):
+
+```
+cd tools/remote-input
+./build_app.sh --install        # builds "PiStorm Remote.app" and copies it to /Applications
+```
+
+Then open *PiStorm Remote* from the Finder or Launchpad, fill in the Raspberry Pi address, the SSH user and the
+password, and press *Connecter*. On first launch macOS asks for the *Accessibility* and *Input Monitoring*
+permissions for the application. Leave the password empty to use an SSH key or the ssh-agent instead.
+The new host keys are trusted on first use, a changed key is refused. Settings live in
+`~/Library/Application Support/PiStormRemote/settings.json`. Rebuilding the application changes its signature, so
+macOS asks for the permissions again after a rebuild.
+
 # CPLD bitstream update :
 
 Install OpenOCD:

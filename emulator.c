@@ -4,6 +4,7 @@
 #include "emulator.h"
 #include "platforms/platforms.h"
 #include "input/input.h"
+#include "input/remote_input.h"
 #include "m68kcpu.h"
 
 #include "platforms/amiga/Gayle.h"
@@ -40,12 +41,15 @@
 #include <unistd.h>
 
 #include "m68kops.h"
+#include "input/remote_diag.h"
 
 #define KEY_POLL_INTERVAL_MSEC 5000
 
 unsigned int ovl;
 
 int kb_hook_enabled = 0;
+// set by the remote input thread while a remote client may be sending keys; independent from the local keyboard hook
+int remote_kb_active = 0;
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -122,6 +126,18 @@ uint16_t irq_delay = 0;
 unsigned int amiga_reset=0, amiga_reset_last=0;
 unsigned int do_reset=0;
 
+// While an interrupt is pending the CPU only runs 5 cycles per loop and reads the CPLD status register each time, so as
+// to take the interrupt as soon as the Amiga unmasks it. When the CPU masks that level (SR interrupt mask >= level) this
+// is pure loss: the code that holds the mask, typically a game redrawing its screen with SR=$2700, crawls (seconds
+// instead of milliseconds) for as long as the interrupt stays pending, e.g. an unread remote keypress. The core itself
+// checks for pending interrupts whenever SR is written, so running full slices while masked loses no latency.
+static inline int irq_deliverable(void) {
+  if (!last_last_irq)
+    return 1; // not presented to the core yet
+  unsigned mask = (m68k_get_reg(NULL, M68K_REG_SR) >> 8) & 7;
+  return last_last_irq == 7 || last_last_irq > mask;
+}
+
 void *ipl_task(void *args) {
   printf("IPL thread running\n");
   uint16_t old_irq = 0;
@@ -132,7 +148,9 @@ void *ipl_task(void *args) {
     if (value & (1 << PIN_TXN_IN_PROGRESS))
       goto noppers;
 
-    if (!(value & (1 << PIN_IPL_ZERO)) || ipl_enabled[amiga_emulated_ipl()]) {
+    // An emulated interrupt is only raised when the master enable (INTENA bit 14) and its level are enabled,
+    // like the real chipset: otherwise exec's level 2 handler sees INTEN off, does an RTE and is re-entered forever.
+    if (!(value & (1 << PIN_IPL_ZERO)) || (ipl_enabled[7] && ipl_enabled[amiga_emulated_ipl()])) {
       old_irq = irq_delay;
       //NOP
       if (!irq) {
@@ -273,6 +291,12 @@ void *cpu_task() {
 	m68k_pulse_reset(state);
 
 cpu_loop:
+  remote_mouse_poll();
+  // keyboard: the CPU thread is the only one raising the emulated PORTS interrupt, other threads only ask for it
+  kb_sdr_tick();
+  remote_diag_cpu_poll();
+  if (kb_irq_poll() && (kb_hook_enabled || remote_kb_active) && !amiga_emulating_irq(PORTS))
+    amiga_emulate_irq(PORTS);
   if (mouse_hook_enabled) {
     get_mouse_status(&mouse_dx, &mouse_dy, &mouse_buttons, &mouse_extra);
   }
@@ -290,7 +314,7 @@ cpu_loop:
   }
   else {
     if (cpu_emulation_running) {
-		if (irq)
+		if (irq && irq_deliverable())
 			m68k_execute_bef(state, 5);
 		else
 			m68k_execute_bef(state, loop_cycles);
@@ -383,8 +407,8 @@ key_loop:
 
   // if kpollrc > 0 then it contains number of events to pull, also check if POLLIN is set in revents
   if ((kpollrc <= 0) || !(kbdpoll[0].revents & POLLIN)) {
-    if (cfg->platform->id == PLATFORM_AMIGA && last_irq != 2 && get_num_kb_queued()) {
-      amiga_emulate_irq(PORTS);
+    if (cfg->platform->id == PLATFORM_AMIGA && kb_irq_wanted()) {
+      kb_request_irq();
     }
     goto key_loop;
   }
@@ -407,8 +431,8 @@ key_loop:
         }
       } else {
         if (queue_keypress(c_code, c_type, cfg->platform->id)) {
-          if (cfg->platform->id == PLATFORM_AMIGA && last_irq != 2) {
-            amiga_emulate_irq(PORTS);
+          if (cfg->platform->id == PLATFORM_AMIGA) {
+            kb_request_irq();
           }
         }
       }
@@ -695,8 +719,16 @@ switch_config:
     printf("[MAIN] CPU thread created successfully\n");
   }
 
+  // create remote input task (keyboard/mouse injection over a loopback TCP port, meant to be used through an SSH tunnel)
+  if (cfg->remote_input_port && cfg->platform->id == PLATFORM_AMIGA) {
+    if (remote_input_start(cfg->remote_input_port) == 0)
+      printf("[MAIN] Remote input thread created successfully\n");
+  }
+
   // wait for cpu task to end before closing up and finishing
   pthread_join(cpu_tid, NULL);
+
+  remote_input_stop();
 
   while (!emulator_exiting) {
     emulator_exiting = 1;
@@ -781,14 +813,71 @@ static inline void ps_write(uint8_t type, uint32_t addr, uint32_t val) {
   return;
 }
 
+// CIA-A only decodes A8-A11 to select its register and sits on D0-D7 (odd byte addresses): $bfe003 and $bfe0ff are PRA
+// like $bfe001, $bfe801 is the same register as $bfe8ff... Games do read the fire button through such mirrors
+// (Battle Squadron at $bfe003, Deluxe Galaga at $bfe0ff). Use the canonical address to recognise the register, the
+// access itself still goes to the address the Amiga used.
+static inline uint32_t cia_a_canonical(uint8_t type, uint32_t addr) {
+  if (type == OP_TYPE_BYTE && (addr & 0xFFF001) == 0xBFE001)
+    return 0xBFE001 | (addr & 0x000F00);
+  return addr;
+}
+
+// May a read of CIAAICR/CIAADAT present the next queued remote key? Yes when the emulated PORTS interrupt is pending,
+// but also when a key is merely waiting: a game that polls the keyboard with its interrupts masked (Battle Squadron
+// runs with SR=$2700) never takes the interrupt, and clears INTREQ blindly in its main loop, which drops our pending
+// bit thousands of times a second. Tying the latch to that bit delivered a key only when a poll happened to fall in
+// the few microseconds the bit was set, i.e. seconds late.
+static inline int kb_may_latch(void) {
+  return amiga_emulating_irq(PORTS) || kb_irq_wanted();
+}
+
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
   switch (cfg->platform->id) {
     case PLATFORM_AMIGA:
+      DIAG(if ((remote_joystick_mask() & 0x10) && remote_joystick_present() &&
+               ((addr >> 16) == 0xBF || (addr & 0xFFFE00) == 0xDFF000))
+             remote_diag_fire_census_hit(type, addr);)
+      addr = cia_a_canonical(type, addr);
       switch (addr) {
         case INTREQR:
-          return amiga_handle_intrqr_read(res);
+        case INTREQR + 1: {
+          // The emulated PORTS bit must be visible whatever the width of the access: WHDload's level 2 handler tests
+          // it with btst.b #3,$dff01f (low byte), and never saw it, so it never read the key and kept being re-entered.
+          uint32_t w;
+          if (!amiga_handle_intrqr_read(&w))
+            return 0;
+          if (type == OP_TYPE_BYTE)
+            *res = (addr & 1) ? (w & 0xFF) : ((w >> 8) & 0xFF);
+          else if (addr & 1)
+            return 0;
+          else if (type == OP_TYPE_LONGWORD)
+            *res = (w << 16) | (uint16_t)ps_read_16(INTREQR + 2); // INTREQR followed by $dff020 (DSKPTH, write only)
+          else
+            *res = w;
+          return 1;
+        }
           break;
-        case CIAAPRA:
+        case CIAAPRA: {
+          DIAG(if (remote_joystick_present()) {
+                 DIAG_COUNT(remote_diag_pra);
+                 remote_diag_pra_type = (int32_t)type;
+               })
+          uint8_t rfire = remote_joystick_present() ? (remote_joystick_mask() & 0x10) : 0;
+          if ((remote_mouse_buttons() & 0x01) || rfire) {
+            // remote left button pulls FIR0 (bit 6) low, remote joystick fire pulls FIR1 (bit 7) low
+            rres = (uint32_t)ps_read(type, addr);
+            if (remote_mouse_buttons() & 0x01)
+              rres &= ~0x40u;
+            if (rfire) {
+              rres &= ~0x80u;
+              DIAG(remote_diag_pra_fire = (int32_t)(rres & 0xFF);)
+            }
+            if (swap_df0_with_dfx && spoof_df0_id)
+              rres &= 0xDF;
+            *res = rres;
+            return 1;
+          }
           if (mouse_hook_enabled && (mouse_buttons & 0x01)) {
             rres = (uint32_t)ps_read(type, addr);
             *res = (rres ^ 0x40);
@@ -802,29 +891,82 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             return 1;
           }
           return 0;
-          break;
+        }
         case CIAAICR:
-          if (kb_hook_enabled && get_num_kb_queued() && amiga_emulating_irq(PORTS)) {
-            *res = 0x88;
+          // The keyboard byte is reported through the SP flag (0x88 = IR + SP), together with whatever the real
+          // CIA reports (timers, TOD...): replacing the register would hide those and leave the CIA interrupt
+          // line asserted. Reading the ICR clears the flag, as on the real chip.
+          if ((kb_hook_enabled || remote_kb_active) && kb_icr_sp_take(kb_may_latch())) {
+            DIAG_COUNT(remote_diag_icr);
+            rres = (uint32_t)ps_read(type, addr);
+            *res = rres | 0x88;
             return 1;
           }
-          return 0;
-          break;
-        case CIAADAT:
-          if (kb_hook_enabled && amiga_emulating_irq(PORTS)) {
-            uint8_t c = 0, t = 0;
-            pop_queued_key(&c, &t);
-            t ^= 0x01;
-            rres = ((c << 1) | t) ^ 0xFF;
+          if ((kb_hook_enabled || remote_kb_active) && kb_sdr_retained()) {
+            // a real key stroke shows up as SP in the real ICR: it replaces the byte we keep presenting in the SDR
+            rres = (uint32_t)ps_read(type, addr);
+            if (rres & 0x08)
+              kb_sdr_forget();
             *res = rres;
             return 1;
           }
           return 0;
           break;
+        case CIAADAT:
+          // The SDR can be read any number of times (keyboard.device and lowlevel.library both read it in the same
+          // interrupt) and returns the same key until the keyboard handshake, see kb_sdr_read().
+          if (kb_hook_enabled || remote_kb_active) {
+            uint8_t c = 0, t = 0;
+            int kind = kb_sdr_read(kb_may_latch(), &c, &t);
+            if (kind) {
+              DIAG(if (kind != 3) { // 3: polled after the handshake, would flood the log
+                     DIAG_COUNT(remote_diag_dat);
+                     if (remote_kb_active)
+                       remote_diag_log_dat(c, t, kind);
+                   })
+              t ^= 0x01;
+              rres = ((c << 1) | t) ^ 0xFF;
+              *res = rres;
+              return 1;
+            }
+            DIAG(if (remote_kb_active) remote_diag_log_dat(0, 0, 0);) // the real register answers
+          }
+          return 0;
+          break;
         case JOY0DAT:
+          DIAG(if (remote_joystick_present() && type <= OP_TYPE_LONGWORD) DIAG_COUNT(remote_diag_joydat[0][type]);)
+          if (type == OP_TYPE_LONGWORD && remote_joystick_present() && !mouse_hook_enabled) {
+            // one 32 bit read gets JOY0DAT and JOY1DAT: keep the real port 1, replace the port 2 half
+            *res = ((uint32_t)ps_read(type, addr) & 0xFFFF0000u) | remote_joystick_dat();
+            return 1;
+          }
           if (mouse_hook_enabled) {
-            unsigned short result = (mouse_dy << 8) | (mouse_dx);
+            // Pi mouse replaces the Amiga one; the remote offset is added on top
+            unsigned short result = ((uint8_t)(mouse_dy + remote_mouse_y) << 8) | (uint8_t)(mouse_dx + remote_mouse_x);
             *res = (unsigned int)result;
+            return 1;
+          }
+          if (type == OP_TYPE_WORD && (remote_mouse_x || remote_mouse_y)) {
+            // remote mouse only: add the offset to the real counters so the physical Amiga mouse keeps working
+            uint16_t real = (uint16_t)ps_read(type, addr);
+            *res = (unsigned int)((((real >> 8) + remote_mouse_y) & 0xFF) << 8 | (((real & 0xFF) + remote_mouse_x) & 0xFF));
+            return 1;
+          }
+          return 0;
+          break;
+        case JOY1DAT:
+        case JOY1DAT + 1: // low byte, for games that read the two counters with byte accesses
+          if (remote_joystick_present()) {
+            DIAG(if (type <= OP_TYPE_LONGWORD) DIAG_COUNT(remote_diag_joydat[1][type]);)
+            uint16_t v = remote_joystick_dat();
+            if (type == OP_TYPE_BYTE)
+              *res = (addr & 1) ? (v & 0xFF) : (v >> 8); // the result is the byte at that address, not the word
+            else if ((addr & 1) || type == OP_TYPE_MEM)
+              return 0;
+            else if (type == OP_TYPE_LONGWORD)
+              *res = ((uint32_t)v << 16) | (uint16_t)ps_read_16(JOY1DAT + 2); // JOY1DAT followed by CLXDAT
+            else
+              *res = v;
             return 1;
           }
           return 0;
@@ -852,15 +994,32 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           if (val & 0x2000) {
             ipl_enabled[6] = enable;
           }
-          if (val & 0x4000) {
-            ipl_enabled[7] = enable;
-          }
+          ipl_enabled[7] = (val & 0x4000) ? 1 : 0; // INTENAR is the real state: resync the master enable
           //printf("Interrupts enabled: M:%d 0-6:%d%d%d%d%d%d\n", ipl_enabled[7], ipl_enabled[6], ipl_enabled[5], ipl_enabled[4], ipl_enabled[3], ipl_enabled[2], ipl_enabled[1]);
           *res = rres;
           return 1;
           break;
         }
         case POTGOR:
+          if (remote_joystick_present() && (remote_joystick_mask() & 0x20)) {
+            // remote joystick second button (port 2, DATRY bit 14), active low, merged with the remote mouse buttons
+            uint32_t pot = (uint32_t)ps_read(type, addr);
+            uint8_t rb = remote_mouse_buttons();
+            pot &= ~0x4000u;
+            if (rb & 0x02) pot &= ~0x0400u;
+            if (rb & 0x04) pot &= ~0x0100u;
+            *res = pot;
+            return 1;
+          }
+          if (remote_mouse_buttons() & 0x06) {
+            // remote right (bit 10) and middle (bit 8) buttons are active low
+            uint32_t pot = (uint32_t)ps_read(type, addr);
+            uint8_t rb = remote_mouse_buttons();
+            if (rb & 0x02) pot &= ~0x0400u;
+            if (rb & 0x04) pot &= ~0x0100u;
+            *res = pot;
+            return 1;
+          }
           if (mouse_hook_enabled) {
             unsigned short result = (unsigned short)ps_read(type, addr);
             // bit 1 rmb, bit 2 mmb
@@ -1006,10 +1165,41 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
       }
       break;
     case PLATFORM_AMIGA:
+      addr = cia_a_canonical(type, addr);
       switch (addr) {
-        case INTREQ:
-          return amiga_handle_intrq_write(val);
+        case INTREQ: {
+          int handled;
+          DIAG(if ((val & 0x0008) && !(val & 0x8000)) DIAG_COUNT(remote_diag_intreq);)
+          handled = amiga_handle_intrq_write(val);
+          // PORTS acknowledged: if more keys are waiting, ask for the next interrupt
+          if ((val & 0x0008) && !(val & 0x8000) && (kb_hook_enabled || remote_kb_active))
+            kb_request_irq();
+          return handled;
           break;
+        }
+        case CIAACRA: {
+          // keyboard handshake: the Amiga sets SPMODE (bit 6) for a moment, and clears it when it is done with
+          // the byte. The write itself still goes to the real CIA.
+          static int spmode_out = 0;
+          if (kb_hook_enabled || remote_kb_active) {
+            int now = (val & 0x40) != 0;
+            if (spmode_out && !now)
+              kb_sdr_ack();
+            spmode_out = now;
+          }
+          return 0;
+          break;
+        }
+#ifdef REMOTE_DIAG
+        case CIAAPRA + 0x200: // CIA-A DDRA
+          remote_diag_ddra = (int32_t)(val & 0xFF);
+          return 0;
+          break;
+        case 0xDFF034: // POTGO
+          remote_diag_potgo = (int32_t)(val & 0xFFFF);
+          return 0;
+          break;
+#endif
         case CIAAPRA:
           if (ovl != (val & (1 << 0))) {
             ovl = (val & (1 << 0));
@@ -1027,6 +1217,7 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           break;
         }
         case INTENA: {
+          DIAG(remote_diag_log_intena(type, addr, val);)
           // This code is kind of strange and should probably be reworked/revoked.
           uint8_t enable = 1;
           if (!(val & 0x8000))
@@ -1049,8 +1240,8 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           if (val & 0x2000) {
             ipl_enabled[6] = enable;
           }
-          if (val & 0x4000 && enable) {
-            ipl_enabled[7] = 1;
+          if (val & 0x4000) {
+            ipl_enabled[7] = enable; // Disable() clears INTEN: stop raising the emulated PORTS
           }
           //printf("Interrupts enabled: M:%d 0-6:%d%d%d%d%d%d\n", ipl_enabled[7], ipl_enabled[6], ipl_enabled[5], ipl_enabled[4], ipl_enabled[3], ipl_enabled[2], ipl_enabled[1]);
           return 0;

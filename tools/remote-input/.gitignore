@@ -1,0 +1,6 @@
+__pycache__/
+.build-venv/
+build/
+dist/
+*.iconset/
+*.icns

@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "platforms/platforms.h"
@@ -150,12 +151,12 @@ uint8_t mouse_x = 0, mouse_y = 0;
 int get_mouse_status(uint8_t *x, uint8_t *y, uint8_t *b, uint8_t *e) {
   uint8_t mouse_ev[4];
   if (read(mouse_fd, &mouse_ev, 4) != -1) {
-    *b = ((uint8_t *)&mouse_ev)[0];
-    *e = ((uint8_t *)&mouse_ev)[3];
+    *b = mouse_ev[0];
+    *e = mouse_ev[3];
 
-    mouse_x += ((uint8_t *)&mouse_ev)[1];
+    mouse_x += mouse_ev[1];
     *x = mouse_x;
-    mouse_y += (-((uint8_t *)&mouse_ev)[2]);
+    mouse_y += (-mouse_ev[2]);
     *y = mouse_y;
     return 1;
   }
@@ -163,19 +164,167 @@ int get_mouse_status(uint8_t *x, uint8_t *y, uint8_t *b, uint8_t *e) {
   return 0;
 }
 
+/**
+ * Remote (injected) mouse. The remote thread accumulates deltas and button state with atomics, the CPU thread
+ * calls remote_mouse_poll() every loop iteration to turn them into the counters below.
+ *
+ * remote_mouse_x/y are NOT a replacement for the Amiga mouse: they are an offset that platform_read_check()
+ * adds to the real JOY0DAT counters, so the physical mouse of the Amiga keeps working. Once non-zero the
+ * offset has to stay applied forever, as the Amiga only looks at differences between two reads.
+ * Deltas use screen orientation: +dx = right, +dy = down.
+ */
+#define REMOTE_PENDING_LIMIT 4096
+#define REMOTE_STEP_MAX 16
+static int32_t remote_dx = 0, remote_dy = 0;
+static uint8_t remote_buttons = 0;
+uint8_t remote_mouse_x = 0, remote_mouse_y = 0; // CPU thread only
+
+static void remote_accumulate(int32_t *target, int delta) {
+  int32_t cur = __atomic_load_n(target, __ATOMIC_RELAXED);
+  // don't let the backlog grow without bound if the CPU thread isn't consuming
+  if (cur + delta > REMOTE_PENDING_LIMIT || cur + delta < -REMOTE_PENDING_LIMIT)
+    return;
+  __atomic_fetch_add(target, delta, __ATOMIC_RELAXED);
+}
+
+void inject_mouse_move(int dx, int dy) {
+  if (dx)
+    remote_accumulate(&remote_dx, dx);
+  if (dy)
+    remote_accumulate(&remote_dy, dy);
+}
+
+void inject_mouse_buttons(uint8_t buttons) {
+  // bit 0: left, bit 1: right, bit 2: middle
+  __atomic_store_n(&remote_buttons, buttons & 0x07, __ATOMIC_RELAXED);
+}
+
+void clear_injected_mouse(void) {
+  // pending movement and buttons are dropped; the counters already applied must stay (see above)
+  __atomic_store_n(&remote_dx, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&remote_dy, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&remote_buttons, 0, __ATOMIC_RELAXED);
+}
+
+uint8_t remote_mouse_buttons(void) {
+  return __atomic_load_n(&remote_buttons, __ATOMIC_RELAXED);
+}
+
+/**
+ * Remote joystick, presented on Amiga port 2 (JOY1DAT, fire on CIAAPRA bit 7, second button on POTGOR bit 14).
+ * Mask: 1 up, 2 down, 4 left, 8 right, 16 fire, 32 button 2. While the remote joystick has a direction or
+ * button pressed ("present"), it replaces whatever is on port 2; otherwise reads go to the real port.
+ */
+static uint8_t remote_joy = 0, remote_joy_on = 0;
+
+void inject_joystick(uint8_t mask) {
+  mask &= 0x3F;
+  __atomic_store_n(&remote_joy, mask, __ATOMIC_RELAXED);
+  // a centered remote joystick hands the port back to the real one
+  __atomic_store_n(&remote_joy_on, mask != 0, __ATOMIC_RELAXED);
+}
+
+void clear_injected_joystick(void) {
+  __atomic_store_n(&remote_joy, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&remote_joy_on, 0, __ATOMIC_RELAXED);
+}
+
+int remote_joystick_present(void) {
+  return __atomic_load_n(&remote_joy_on, __ATOMIC_RELAXED);
+}
+
+uint8_t remote_joystick_mask(void) {
+  return __atomic_load_n(&remote_joy, __ATOMIC_RELAXED);
+}
+
+// JOY1DAT word for a digital joystick: bit 1 right, bit 9 left, bit 0 = down^right, bit 8 = up^left.
+// Opposite directions cancel out.
+uint16_t remote_joystick_dat(void) {
+  uint8_t m = remote_joystick_mask();
+  int up = m & 1, down = (m >> 1) & 1, left = (m >> 2) & 1, right = (m >> 3) & 1;
+  if (up && down)
+    up = down = 0;
+  if (left && right)
+    left = right = 0;
+  uint16_t v = 0;
+  if (right)
+    v |= 0x0002;
+  if (left)
+    v |= 0x0200;
+  if (down ^ right)
+    v |= 0x0001;
+  if (up ^ left)
+    v |= 0x0100;
+  return v;
+}
+
+static inline int32_t clamp_step(int32_t v) {
+  return v > REMOTE_STEP_MAX ? REMOTE_STEP_MAX : (v < -REMOTE_STEP_MAX ? -REMOTE_STEP_MAX : v);
+}
+
+// Called from the CPU thread only. Moves are consumed in small steps so that the 8 bit counters never jump
+// by more than the Amiga can disambiguate between two reads of JOY0DAT.
+void remote_mouse_poll(void) {
+  int32_t pdx = __atomic_load_n(&remote_dx, __ATOMIC_RELAXED);
+  int32_t pdy = __atomic_load_n(&remote_dy, __ATOMIC_RELAXED);
+  if (pdx || pdy) {
+    int32_t sx = clamp_step(pdx), sy = clamp_step(pdy);
+    __atomic_fetch_sub(&remote_dx, sx, __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&remote_dy, sy, __ATOMIC_RELAXED);
+    remote_mouse_x += (uint8_t)sx;
+    remote_mouse_y += (uint8_t)sy;
+  }
+}
+
+/**
+ * The key queue is written by the local keyboard thread and the remote input thread, and read by the
+ * CPU thread, so every access to the ring buffer goes through kb_queue_lock. The CPU thread only takes
+ * it when the Amiga actually reads a key (CIAADAT), never in its main loop.
+ */
+static pthread_mutex_t kb_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t queued_keypresses = 0, queue_output_pos = 0, queue_input_pos = 0;
 static uint8_t queued_keys[256];
 static uint8_t queued_events[256];
 
+// state of the emulated SDR, see below
+static uint8_t sdr_valid = 0, sdr_c = 0, sdr_t = 0, sp_flag = 0, irq_request = 0;
+// The real SDR keeps the last byte it received until the next one: games poll it directly (Battle Squadron's menu does
+// cmp.b $bfec01,d1 in its main loop), long after the keyboard handshake. Keep presenting the last key we delivered.
+static uint8_t sdr_last_c = 0, sdr_last_t = 0, sdr_last_valid = 0;
+static int64_t sdr_since_ms = 0;
+
 void clear_keypress_queue() {
+  pthread_mutex_lock(&kb_queue_lock);
   memset(queued_keys, 0x80, 256);
   memset(queued_events, 0x80, 256);
-  queued_keypresses = 0;
+  __atomic_store_n(&queued_keypresses, 0, __ATOMIC_RELAXED);
   queue_output_pos = 0;
   queue_input_pos = 0;
+  __atomic_store_n(&sdr_valid, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&sp_flag, 0, __ATOMIC_RELAXED);
+  pthread_mutex_unlock(&kb_queue_lock);
 }
 
+static int queue_keypress_locked(uint8_t keycode, uint8_t event_type, uint8_t platform);
+
 int queue_keypress(uint8_t keycode, uint8_t event_type, uint8_t platform) {
+  pthread_mutex_lock(&kb_queue_lock);
+  int ret = queue_keypress_locked(keycode, event_type, platform);
+  pthread_mutex_unlock(&kb_queue_lock);
+  return ret;
+}
+
+// Same as queue_keypress, but also tracks the caps lock state, which for local keys is done by handle_modifier
+int queue_remote_keypress(uint8_t keycode, uint8_t event_type, uint8_t platform) {
+  pthread_mutex_lock(&kb_queue_lock);
+  if (keycode == KEY_CAPSLOCK && event_type == KEYPRESS_PRESS)
+    capslk = !capslk;
+  int ret = queue_keypress_locked(keycode, event_type, platform);
+  pthread_mutex_unlock(&kb_queue_lock);
+  return ret;
+}
+
+static int queue_keypress_locked(uint8_t keycode, uint8_t event_type, uint8_t platform) {
   char *keymap = NULL;
   switch (platform) {
     case PLATFORM_AMIGA:
@@ -186,8 +335,8 @@ int queue_keypress(uint8_t keycode, uint8_t event_type, uint8_t platform) {
       break;
   }
   if (keymap != NULL) {
-    if (keymap[keycode] != NONE) {
-      if (queued_keypresses < 255) {
+    if ((uint8_t)keymap[keycode] != NONE) {
+      if (__atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED) < 255) {
         // printf("Keypress queued, matched %.2X to host key code %.2X\n", keycode, keymap[keycode]);
         if (keycode == KEY_CAPSLOCK) {
           if (event_type == KEYPRESS_RELEASE) {
@@ -198,7 +347,7 @@ int queue_keypress(uint8_t keycode, uint8_t event_type, uint8_t platform) {
         queued_keys[queue_output_pos] = keymap[keycode];
         queued_events[queue_output_pos] = event_type;
         queue_output_pos++;
-        queued_keypresses++;
+        __atomic_fetch_add(&queued_keypresses, 1, __ATOMIC_RELAXED);
         return 1;
       }
     }
@@ -206,21 +355,133 @@ int queue_keypress(uint8_t keycode, uint8_t event_type, uint8_t platform) {
   return 0;
 }
 
+/**
+ * The CIA-A serial data register (SDR, CIAADAT) as the Amiga sees it.
+ *
+ * The real SDR keeps the byte sent by the keyboard until the next one arrives, so every reader of an interrupt
+ * (keyboard.device, but also lowlevel.library's keyboard interrupt, games...) reads the same byte, any number of
+ * times. The keyboard only sends the next byte once the Amiga has done the handshake, a pulse of the SPMODE bit
+ * (bit 6) of CIAACRA. So the key at the head of the queue is "latched" into sdr_* and stays there, whatever the
+ * number of reads, until the handshake ends (kb_sdr_ack). Popping a key on every read, as was done before, makes
+ * a second reader swallow events.
+ *
+ * sp_flag is the SP bit of CIAAICR: raised when a key is latched, cleared by the first read of the ICR.
+ * Latching, reads and acknowledgement happen on the CPU thread; the other threads only look at the atomics.
+ */
+#define SDR_TIMEOUT_MSEC 150 // an Amiga that never does the handshake must not stall the keyboard for ever
+uint32_t kb_sdr_timeouts = 0;
+
+static int64_t coarse_msec(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Events not completely handed over to the Amiga: queued keys plus the one sitting in the SDR
 int get_num_kb_queued() {
-  return queued_keypresses;
+  return __atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED) + __atomic_load_n(&sdr_valid, __ATOMIC_RELAXED);
 }
 
 void pop_queued_key(uint8_t *c, uint8_t *t) {
+  pthread_mutex_lock(&kb_queue_lock);
   if (queued_keypresses == 0) {
     *c = NONE;
     *t = NONE;
-    return;
+  } else {
+    *c = queued_keys[queue_input_pos];
+    *t = queued_events[queue_input_pos];
+    queue_input_pos++;
+    __atomic_fetch_sub(&queued_keypresses, 1, __ATOMIC_RELAXED);
   }
-  *c = queued_keys[queue_input_pos];
-  *t = queued_events[queue_input_pos];
-  queue_input_pos++;
-  queued_keypresses--;
-  return;
+  pthread_mutex_unlock(&kb_queue_lock);
+}
+
+static int sdr_latch_next(void) {
+  if (__atomic_load_n(&sdr_valid, __ATOMIC_RELAXED))
+    return 1;
+  if (!__atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED))
+    return 0;
+  pop_queued_key(&sdr_c, &sdr_t);
+  sdr_last_c = sdr_c;
+  sdr_last_t = sdr_t;
+  __atomic_store_n(&sdr_last_valid, 1, __ATOMIC_RELEASE);
+  sdr_since_ms = coarse_msec();
+  __atomic_store_n(&sp_flag, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&sdr_valid, 1, __ATOMIC_RELEASE);
+  return 1;
+}
+
+// CIAADAT read. Returns 0 if there is nothing to present (let the real register answer), 2 if a new key was
+// latched by this read, 1 if the same key is read again, 3 if the handshake is over and the last key is still in the
+// register. may_latch: an emulated interrupt is pending or a key is waiting.
+int kb_sdr_read(int may_latch, uint8_t *c, uint8_t *t) {
+  int fresh = 0;
+  if (!__atomic_load_n(&sdr_valid, __ATOMIC_ACQUIRE)) {
+    if (!may_latch || !sdr_latch_next()) {
+      if (!__atomic_load_n(&sdr_last_valid, __ATOMIC_ACQUIRE))
+        return 0;
+      *c = sdr_last_c;
+      *t = sdr_last_t;
+      return 3;
+    }
+    fresh = 1;
+  }
+  *c = sdr_c;
+  *t = sdr_t;
+  return fresh ? 2 : 1;
+}
+
+// A real key stroke arrived (SP in the real ICR), or the remote client is gone: the SDR is the real one again.
+void kb_sdr_forget(void) {
+  __atomic_store_n(&sdr_last_valid, 0, __ATOMIC_RELEASE);
+}
+
+int kb_sdr_retained(void) {
+  return __atomic_load_n(&sdr_last_valid, __ATOMIC_ACQUIRE);
+}
+
+// CIAAICR read. Returns 1 if the SP flag must be reported by this read (and clears it).
+int kb_icr_sp_take(int may_latch) {
+  if (may_latch)
+    sdr_latch_next();
+  if (!__atomic_load_n(&sp_flag, __ATOMIC_RELAXED))
+    return 0;
+  __atomic_store_n(&sp_flag, 0, __ATOMIC_RELAXED);
+  return 1;
+}
+
+// The handshake ended: the Amiga is done with the byte in the SDR, the next key can be sent.
+void kb_sdr_ack(void) {
+  __atomic_store_n(&sp_flag, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&sdr_valid, 0, __ATOMIC_RELEASE);
+  kb_request_irq();
+}
+
+// CPU thread, every loop iteration: give up on a handshake that never comes
+void kb_sdr_tick(void) {
+  if (__atomic_load_n(&sdr_valid, __ATOMIC_RELAXED) && coarse_msec() - sdr_since_ms > SDR_TIMEOUT_MSEC) {
+    kb_sdr_timeouts++;
+    kb_sdr_ack();
+  }
+}
+
+// Is there something the Amiga has to be interrupted for?
+int kb_irq_wanted(void) {
+  return __atomic_load_n(&sp_flag, __ATOMIC_RELAXED) ||
+         (!__atomic_load_n(&sdr_valid, __ATOMIC_RELAXED) && __atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED));
+}
+
+// Any thread: ask the CPU thread to raise the keyboard interrupt, it is the only one touching the interrupt state
+void kb_request_irq(void) {
+  __atomic_store_n(&irq_request, 1, __ATOMIC_RELEASE);
+}
+
+// CPU thread: returns 1 if the keyboard interrupt must be raised now
+int kb_irq_poll(void) {
+  if (!__atomic_load_n(&irq_request, __ATOMIC_RELAXED))
+    return 0;
+  __atomic_store_n(&irq_request, 0, __ATOMIC_RELAXED);
+  return kb_irq_wanted();
 }
 
 int grab_device(int fd) {
