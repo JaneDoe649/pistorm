@@ -114,9 +114,39 @@ inputs keep working (the two sources are merged).
    `Control+Option+G` releases or re-grabs the inputs, `Control+Option+Q` quits. The Mac Command keys are the Amiga keys.
 
 The protocol is line based and can be driven by hand through the tunnel (`nc 127.0.0.1 7777`), see `input/remote_input.h`:
-`K <linux key code> <1|0>`, `M <dx> <dy>`, `B <button mask>`, `W <ticks>`, `J <joystick mask>`, `P`.
+`K <linux key code> <1|0>`, `M <dx> <dy>`, `B <button mask>`, `J <joystick mask>`, `P`. The mouse wheel is not forwarded.
 A client that disconnects has all its keys, buttons and joystick directions released automatically. The Amiga key queue holds 255 events,
 so clients should avoid sending key bursts faster than a few hundred events per second.
+
+### Key mapping
+
+The client sends physical key positions, so the layout of the Mac keyboard does not matter. The letters, digits and
+punctuation keys land on the Amiga key at the same position (the extra ISO key next to the left Shift is the Amiga
+`<>` key). The other keys:
+
+| Mac key | Amiga key | Remark |
+|---|---|---|
+| Left / Right Command | Left / Right Amiga | |
+| Left / Right Option | Left / Right Alt | |
+| Left or Right Control | Ctrl | there is a single Amiga Ctrl |
+| Shift, Caps Lock | Shift, Caps Lock | Caps Lock is a latching key on the Amiga too |
+| Return, Tab, Space, Escape | Return, Tab, Space, Esc | |
+| Delete (backspace) | Backspace | |
+| Forward Delete | Del | |
+| **Home** (`Fn+←` on a laptop) | **Help** | the only Mac key that gives Help |
+| Page Up | Keypad `(` | |
+| F1 to F10 | F1 to F10 | F10 is the default WHDload quit key |
+| Arrow keys | Cursor keys | |
+| Keypad `0`-`9`, `.`, `+`, `-`, `/`, Enter | same Amiga keypad keys | |
+| **Keypad `*`** | **Keypad `*`** | Amiga raw key `$5D`, the "PrtScr" quit key of some WHDload slaves (Battle Squadron) |
+
+No Amiga key is sent for **F11, F12, End, Page Down**, the **Help/Insert** key of extended Mac keyboards, F13 and above, nor
+the other keys not listed here. The table is `MAC_TO_LINUX` in `tools/remote-input/remote_core.py` (Mac virtual key
+code to Linux key code) followed by `keymap_amiga` in `input/input.c` (Linux key code to Amiga raw key).
+
+WHDload quits on the key set by the slave, or by its `QuitKey=` tooltype (Deluxe Galaga: F10, Battle Squadron: keypad
+`*`). A Mac keyboard without a numeric keypad cannot type the keypad `*`: for such a slave, set `QuitKey=` to a key from
+the table above. Home gives Help for slaves that quit on Help.
 
 ### USB gamepad on Amiga port 2
 
