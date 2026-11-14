@@ -1336,8 +1336,9 @@ void m68k_write_memory_16(unsigned int address, unsigned int value) {
     return;
 
   if (address & 0x01) {
-    ps_write_8((uint32_t)address, value & 0xFF);
-    ps_write_8((uint32_t)address + 1, (value >> 8) & 0xFF);
+    // 68k is big-endian: the high byte goes to the lower (odd) address.
+    ps_write_8((uint32_t)address, (value >> 8) & 0xFF);
+    ps_write_8((uint32_t)address + 1, value & 0xFF);
     return;
   }
 
@@ -1353,9 +1354,10 @@ void m68k_write_memory_32(unsigned int address, unsigned int value) {
     return;
 
   if (address & 0x01) {
-    ps_write_8((uint32_t)address, value & 0xFF);
-    ps_write_16((uint32_t)address + 1, htobe16(((value >> 8) & 0xFFFF)));
-    ps_write_8((uint32_t)address + 3, (value >> 24));
+    // Big-endian: byte 3 (MSB) at address, bytes 2-1 as a word at address + 1, byte 0 (LSB) last.
+    ps_write_8((uint32_t)address, (value >> 24) & 0xFF);
+    ps_write_16((uint32_t)address + 1, (value >> 8) & 0xFFFF);
+    ps_write_8((uint32_t)address + 3, value & 0xFF);
     return;
   }
 
