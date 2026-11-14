@@ -883,7 +883,22 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
       addr = cia_a_canonical(type, addr);
       switch (addr) {
         case INTREQR:
-          return amiga_handle_intrqr_read(res);
+        case INTREQR + 1: {
+          // The emulated PORTS bit must be visible whatever the width of the access: WHDload's level 2 handler tests
+          // it with btst.b #3,$dff01f (low byte), and never saw it, so it never read the key and kept being re-entered.
+          uint32_t w;
+          if (!amiga_handle_intrqr_read(&w))
+            return 0;
+          if (type == OP_TYPE_BYTE)
+            *res = (addr & 1) ? (w & 0xFF) : ((w >> 8) & 0xFF);
+          else if (addr & 1)
+            return 0;
+          else if (type == OP_TYPE_LONGWORD)
+            *res = (w << 16) | (uint16_t)ps_read_16(INTREQR + 2); // INTREQR followed by $dff020 (DSKPTH, write only)
+          else
+            *res = w;
+          return 1;
+        }
           break;
         case CIAAPRA: {
           if (remote_joystick_present()) {
@@ -984,7 +999,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             else if ((addr & 1) || type == OP_TYPE_MEM)
               return 0;
             else if (type == OP_TYPE_LONGWORD)
-              *res = (uint32_t)v << 16; // JOY1DAT followed by JOYTEST, which is write only
+              *res = ((uint32_t)v << 16) | (uint16_t)ps_read_16(JOY1DAT + 2); // JOY1DAT followed by CLXDAT
             else
               *res = v;
             return 1;
