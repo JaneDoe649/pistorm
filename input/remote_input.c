@@ -434,6 +434,7 @@ static void accept_client(void) {
   // The mouse needs no hook: the remote offset is added to the real counters. Keys go through the key queue,
   // which the CIA reads serve only while remote_kb_active is set; the Amiga's own keyboard keeps working
   // when nothing is queued.
+  kb_sdr_forget(); // a new session starts from the real register
   remote_kb_active = 1;
   printf("[REMOTE] Client connected\n");
 }
@@ -517,8 +518,10 @@ static void *remote_task(void *arg) {
     print_dat_log();
     if (kb_irq_wanted())
       kick_keyboard_irq();
-    else if (client_fd == -1 && !pending_releases)
+    else if (client_fd == -1 && !pending_releases) {
       remote_kb_active = 0; // queue drained after the last client left, hand the CIA back
+      kb_sdr_forget();
+    }
   }
 
   drop_client();

@@ -957,6 +957,14 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             *res = rres | 0x88;
             return 1;
           }
+          if ((kb_hook_enabled || remote_kb_active) && kb_sdr_retained()) {
+            // a real key stroke shows up as SP in the real ICR: it replaces the byte we keep presenting in the SDR
+            rres = (uint32_t)ps_read(type, addr);
+            if (rres & 0x08)
+              kb_sdr_forget();
+            *res = rres;
+            return 1;
+          }
           return 0;
           break;
         case CIAADAT:
@@ -966,9 +974,11 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             uint8_t c = 0, t = 0;
             int kind = kb_sdr_read(kb_may_latch(), &c, &t);
             if (kind) {
-              __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
-              if (remote_kb_active)
-                remote_diag_log_dat(c, t, kind);
+              if (kind != 3) { // 3: polled after the handshake, would flood the log
+                __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
+                if (remote_kb_active)
+                  remote_diag_log_dat(c, t, kind);
+              }
               t ^= 0x01;
               rres = ((c << 1) | t) ^ 0xFF;
               *res = rres;

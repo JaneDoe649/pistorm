@@ -288,6 +288,9 @@ static uint8_t queued_events[256];
 
 // state of the emulated SDR, see below
 static uint8_t sdr_valid = 0, sdr_c = 0, sdr_t = 0, sp_flag = 0, irq_request = 0;
+// The real SDR keeps the last byte it received until the next one: games poll it directly (Battle Squadron's menu does
+// cmp.b $bfec01,d1 in its main loop), long after the keyboard handshake. Keep presenting the last key we delivered.
+static uint8_t sdr_last_c = 0, sdr_last_t = 0, sdr_last_valid = 0;
 static int64_t sdr_since_ms = 0;
 
 void clear_keypress_queue() {
@@ -399,6 +402,9 @@ static int sdr_latch_next(void) {
   if (!__atomic_load_n(&queued_keypresses, __ATOMIC_RELAXED))
     return 0;
   pop_queued_key(&sdr_c, &sdr_t);
+  sdr_last_c = sdr_c;
+  sdr_last_t = sdr_t;
+  __atomic_store_n(&sdr_last_valid, 1, __ATOMIC_RELEASE);
   sdr_since_ms = coarse_msec();
   __atomic_store_n(&sp_flag, 1, __ATOMIC_RELAXED);
   __atomic_store_n(&sdr_valid, 1, __ATOMIC_RELEASE);
@@ -406,17 +412,32 @@ static int sdr_latch_next(void) {
 }
 
 // CIAADAT read. Returns 0 if there is nothing to present (let the real register answer), 2 if a new key was
-// latched by this read, 1 if the same key is read again. may_latch: an emulated interrupt is pending.
+// latched by this read, 1 if the same key is read again, 3 if the handshake is over and the last key is still in the
+// register. may_latch: an emulated interrupt is pending or a key is waiting.
 int kb_sdr_read(int may_latch, uint8_t *c, uint8_t *t) {
   int fresh = 0;
   if (!__atomic_load_n(&sdr_valid, __ATOMIC_ACQUIRE)) {
-    if (!may_latch || !sdr_latch_next())
-      return 0;
+    if (!may_latch || !sdr_latch_next()) {
+      if (!__atomic_load_n(&sdr_last_valid, __ATOMIC_ACQUIRE))
+        return 0;
+      *c = sdr_last_c;
+      *t = sdr_last_t;
+      return 3;
+    }
     fresh = 1;
   }
   *c = sdr_c;
   *t = sdr_t;
   return fresh ? 2 : 1;
+}
+
+// A real key stroke arrived (SP in the real ICR), or the remote client is gone: the SDR is the real one again.
+void kb_sdr_forget(void) {
+  __atomic_store_n(&sdr_last_valid, 0, __ATOMIC_RELEASE);
+}
+
+int kb_sdr_retained(void) {
+  return __atomic_load_n(&sdr_last_valid, __ATOMIC_ACQUIRE);
 }
 
 // CIAAICR read. Returns 1 if the SP flag must be reported by this read (and clears it).

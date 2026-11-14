@@ -29,6 +29,8 @@ void pop_queued_key(uint8_t *c, uint8_t *t);
 int kb_sdr_read(int may_latch, uint8_t *c, uint8_t *t);
 int kb_icr_sp_take(int may_latch);
 void kb_sdr_ack(void);
+void kb_sdr_forget(void);
+int kb_sdr_retained(void);
 void kb_sdr_tick(void);
 int kb_irq_wanted(void);
 void kb_request_irq(void);
