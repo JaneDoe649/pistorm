@@ -63,7 +63,7 @@ static int64_t now_msec(void) {
 // Each read pops one queued key, whereas the real register can be read any number of times: two readers
 // (or a handler reading twice) would swallow events, which is what this log is meant to show.
 #define DAT_LOG_SIZE 64
-struct dat_log_entry { uint8_t key, event, popped; uint32_t icr, dat, acks; };
+struct dat_log_entry { uint8_t key, event, popped; uint32_t icr, dat, acks, timeouts; int64_t ms; };
 static struct dat_log_entry dat_log[DAT_LOG_SIZE];
 static uint32_t dat_log_head = 0, dat_log_printed = 0;
 
@@ -76,6 +76,8 @@ void remote_diag_log_dat(uint8_t key, uint8_t event, int popped) {
   e->icr = __atomic_load_n(&remote_diag_icr, __ATOMIC_RELAXED);
   e->dat = __atomic_load_n(&remote_diag_dat, __ATOMIC_RELAXED);
   e->acks = __atomic_load_n(&remote_diag_intreq, __ATOMIC_RELAXED);
+  e->timeouts = __atomic_load_n(&kb_sdr_timeouts, __ATOMIC_RELAXED); // handshakes that never came (150 ms fallback)
+  e->ms = now_msec();
   __atomic_store_n(&dat_log_head, h + 1, __ATOMIC_RELEASE);
 }
 
@@ -83,11 +85,25 @@ static void print_dat_log(void) {
   uint32_t head = __atomic_load_n(&dat_log_head, __ATOMIC_ACQUIRE);
   if (head - dat_log_printed > DAT_LOG_SIZE)
     dat_log_printed = head - DAT_LOG_SIZE; // overwritten entries are lost
+  // Reads answered by the real register (nothing queued) can come in thousands when a game polls CIAADAT:
+  // print the first one of a run and summarize the rest, so they do not bury the lines that matter.
+  static uint32_t real_run = 0;
   while (dat_log_printed != head) {
     struct dat_log_entry *e = &dat_log[dat_log_printed % DAT_LOG_SIZE];
-    printf("[REMOTE] Amiga read CIAADAT (%s): key=0x%02x event=%u | icr_sp_reports=%u dat_reads=%u portsacks=%u\n",
-           e->popped == 2 ? "new key" : (e->popped == 1 ? "same key again" : "not intercepted"), e->key, e->event,
-           e->icr, e->dat, e->acks);
+    if (!e->popped) {
+      if (real_run++) {
+        dat_log_printed++;
+        continue;
+      }
+    } else if (real_run > 1) {
+      printf("[REMOTE]   ... %u more reads answered by the real register\n", (unsigned)(real_run - 1));
+      real_run = 0;
+    } else {
+      real_run = 0;
+    }
+    printf("[REMOTE] %lld ms Amiga read CIAADAT (%s): key=0x%02x event=%u | icr_sp_reports=%u dat_reads=%u portsacks=%u handshake_timeouts=%u\n",
+           (long long)(e->ms % 1000000), e->popped == 2 ? "new key" : (e->popped == 1 ? "same key again" : "not intercepted"),
+           e->key, e->event, e->icr, e->dat, e->acks, e->timeouts);
     dat_log_printed++;
   }
 }
