@@ -6,6 +6,7 @@ MAINFILES        = emulator.c \
 	config_file/rominfo.c \
 	input/input.c \
 	input/remote_input.c \
+	input/remote_diag.c \
 	gpio/ps_protocol.c \
 	platforms/platforms.c \
 	platforms/amiga/amiga-autoconf.c \
@@ -60,15 +61,30 @@ endif
 # header (emulator.h, input/input.h, m68kconf.h...) rebuilds only the sources that include it.
 CFLAGS   += -MMD -MP
 
+# Remote input diagnostics (verbose logs, see input/remote_diag.h): make REMOTE_DIAG=1 PLATFORM=...
+# The objects that depend on the setting are rebuilt automatically when it changes.
+ifdef REMOTE_DIAG
+	CFLAGS += -DREMOTE_DIAG
+	DIAG_STAMP = .remote_diag.on
+else
+	DIAG_STAMP = .remote_diag.off
+endif
+
 TARGET = $(EXENAME)$(EXE)
 
-DELETEFILES = $(MUSASHIGENCFILES) $(MUSASHIGENHFILES) $(.OFILES) $(.OFILES:%.o=%.d) $(TARGET) $(MUSASHIGENERATOR)$(EXE)
+DELETEFILES = .remote_diag.on .remote_diag.off $(MUSASHIGENCFILES) $(MUSASHIGENHFILES) $(.OFILES) $(.OFILES:%.o=%.d) $(TARGET) $(MUSASHIGENERATOR)$(EXE)
 
 
 all: $(MUSASHIGENCFILES) $(MUSASHIGENHFILES) $(TARGET) buptest
 
 clean:
 	rm -f $(DELETEFILES)
+
+$(DIAG_STAMP):
+	@rm -f .remote_diag.on .remote_diag.off
+	@touch $@
+
+emulator.o input/remote_input.o input/remote_diag.o: $(DIAG_STAMP)
 
 $(TARGET):  $(MUSAHIGENCFILES:%.c=%.o) $(.CFILES:%.c=%.o) a314/a314.o
 	$(CC) -o $@ $^ -O3 -pthread $(LFLAGS) -lm -lstdc++

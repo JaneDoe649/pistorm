@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "m68kops.h"
+#include "input/remote_diag.h"
 
 #define KEY_POLL_INTERVAL_MSEC 5000
 
@@ -49,49 +50,6 @@ unsigned int ovl;
 int kb_hook_enabled = 0;
 // set by the remote input thread while a remote client may be sending keys; independent from the local keyboard hook
 int remote_kb_active = 0;
-// freeze diagnostics, read by remote_input.c (relaxed counters, only touched on the hooked accesses)
-uint32_t remote_diag_icr = 0, remote_diag_dat = 0, remote_diag_intreq = 0;
-// reads of JOY0DAT/JOY1DAT while the remote joystick is active, by access width (byte, word, longword), and of CIAAPRA
-uint32_t remote_diag_joydat[2][3], remote_diag_pra = 0;
-// last CIAAPRA access width and value presented while the remote joystick fire is down; last writes to CIA-A DDRA
-// (a game that makes bit 7 an output reads its own latch there) and to POTGO. -1: never seen.
-int32_t remote_diag_pra_type = -1, remote_diag_pra_fire = -1, remote_diag_ddra = -1, remote_diag_potgo = -1;
-// every CIA / custom register read (address, width) while the remote joystick fire is down, to see which one a game
-// really uses to read the button. Filled by the CPU thread, printed and cleared by the remote input thread.
-// last writes to INTENA (width and value as seen by the hook): our shadow of the master enable is rebuilt from them
-// memory dump requested by the remote input thread when the queue is stuck: only the CPU thread may touch the bus
-#define CODE_DUMP_SIZE 256
-uint32_t remote_diag_dump_addr = 0;
-int remote_diag_dump_req = 0, remote_diag_dump_done = 0;
-uint8_t remote_diag_dump_buf[CODE_DUMP_SIZE];
-// also copied by the CPU thread: the level 2 handler (autovector at VBR 0, assumed 0; a JMP.L is followed), and the real
-// INTENAR / INTREQR, to compare with our shadow of the interrupt enables
-uint32_t remote_diag_l2_vector = 0, remote_diag_l2_target = 0;
-uint8_t remote_diag_l2_buf[CODE_DUMP_SIZE];
-uint16_t remote_diag_real_intenar = 0, remote_diag_real_intreqr = 0;
-#define INTENA_LOG_SIZE 8
-struct intena_log_entry { uint8_t type; uint16_t addr_lo; uint32_t val; };
-struct intena_log_entry remote_diag_intena_log[INTENA_LOG_SIZE];
-uint32_t remote_diag_intena_count = 0;
-#define FIRE_CENSUS_SIZE 64
-struct fire_census_entry { uint32_t addr, count; uint8_t type; };
-struct fire_census_entry remote_diag_fire_census[FIRE_CENSUS_SIZE];
-
-static void fire_census_hit(uint8_t type, uint32_t addr) {
-  for (int i = 0; i < FIRE_CENSUS_SIZE; i++) {
-    struct fire_census_entry *e = &remote_diag_fire_census[i];
-    if (e->count && e->addr == addr && e->type == type) {
-      __atomic_fetch_add(&e->count, 1, __ATOMIC_RELAXED);
-      return;
-    }
-    if (!e->count) {
-      e->addr = addr;
-      e->type = type;
-      __atomic_store_n(&e->count, 1, __ATOMIC_RELEASE);
-      return;
-    }
-  }
-}
 int mouse_hook_enabled = 0;
 int cpu_emulation_running = 1;
 int swap_df0_with_dfx = 0;
@@ -336,20 +294,7 @@ cpu_loop:
   remote_mouse_poll();
   // keyboard: the CPU thread is the only one raising the emulated PORTS interrupt, other threads only ask for it
   kb_sdr_tick();
-  if (__atomic_load_n(&remote_diag_dump_req, __ATOMIC_ACQUIRE)) {
-    for (int i = 0; i < CODE_DUMP_SIZE; i++)
-      remote_diag_dump_buf[i] = (uint8_t)m68k_read_memory_8(remote_diag_dump_addr + i);
-    remote_diag_l2_vector = m68k_read_memory_32(0x68);
-    remote_diag_l2_target = remote_diag_l2_vector;
-    if (m68k_read_memory_16(remote_diag_l2_target) == 0x4ef9)
-      remote_diag_l2_target = m68k_read_memory_32(remote_diag_l2_target + 2);
-    for (int i = 0; i < CODE_DUMP_SIZE; i++)
-      remote_diag_l2_buf[i] = (uint8_t)m68k_read_memory_8(remote_diag_l2_target + i);
-    remote_diag_real_intenar = (uint16_t)ps_read_16(INTENAR);
-    remote_diag_real_intreqr = (uint16_t)ps_read_16(INTREQR);
-    __atomic_store_n(&remote_diag_dump_req, 0, __ATOMIC_RELAXED);
-    __atomic_store_n(&remote_diag_dump_done, 1, __ATOMIC_RELEASE);
-  }
+  remote_diag_cpu_poll();
   if (kb_irq_poll() && (kb_hook_enabled || remote_kb_active) && !amiga_emulating_irq(PORTS))
     amiga_emulate_irq(PORTS);
   if (mouse_hook_enabled) {
@@ -890,9 +835,9 @@ static inline int kb_may_latch(void) {
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
   switch (cfg->platform->id) {
     case PLATFORM_AMIGA:
-      if ((remote_joystick_mask() & 0x10) && remote_joystick_present() &&
-          ((addr >> 16) == 0xBF || (addr & 0xFFFE00) == 0xDFF000))
-        fire_census_hit(type, addr);
+      DIAG(if ((remote_joystick_mask() & 0x10) && remote_joystick_present() &&
+               ((addr >> 16) == 0xBF || (addr & 0xFFFE00) == 0xDFF000))
+             remote_diag_fire_census_hit(type, addr);)
       addr = cia_a_canonical(type, addr);
       switch (addr) {
         case INTREQR:
@@ -914,10 +859,10 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         }
           break;
         case CIAAPRA: {
-          if (remote_joystick_present()) {
-            __atomic_fetch_add(&remote_diag_pra, 1, __ATOMIC_RELAXED);
-            remote_diag_pra_type = (int32_t)type;
-          }
+          DIAG(if (remote_joystick_present()) {
+                 DIAG_COUNT(remote_diag_pra);
+                 remote_diag_pra_type = (int32_t)type;
+               })
           uint8_t rfire = remote_joystick_present() ? (remote_joystick_mask() & 0x10) : 0;
           if ((remote_mouse_buttons() & 0x01) || rfire) {
             // remote left button pulls FIR0 (bit 6) low, remote joystick fire pulls FIR1 (bit 7) low
@@ -926,7 +871,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
               rres &= ~0x40u;
             if (rfire) {
               rres &= ~0x80u;
-              remote_diag_pra_fire = (int32_t)(rres & 0xFF);
+              DIAG(remote_diag_pra_fire = (int32_t)(rres & 0xFF);)
             }
             if (swap_df0_with_dfx && spoof_df0_id)
               rres &= 0xDF;
@@ -952,7 +897,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
           // CIA reports (timers, TOD...): replacing the register would hide those and leave the CIA interrupt
           // line asserted. Reading the ICR clears the flag, as on the real chip.
           if ((kb_hook_enabled || remote_kb_active) && kb_icr_sp_take(kb_may_latch())) {
-            __atomic_fetch_add(&remote_diag_icr, 1, __ATOMIC_RELAXED);
+            DIAG_COUNT(remote_diag_icr);
             rres = (uint32_t)ps_read(type, addr);
             *res = rres | 0x88;
             return 1;
@@ -974,24 +919,22 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
             uint8_t c = 0, t = 0;
             int kind = kb_sdr_read(kb_may_latch(), &c, &t);
             if (kind) {
-              if (kind != 3) { // 3: polled after the handshake, would flood the log
-                __atomic_fetch_add(&remote_diag_dat, 1, __ATOMIC_RELAXED);
-                if (remote_kb_active)
-                  remote_diag_log_dat(c, t, kind);
-              }
+              DIAG(if (kind != 3) { // 3: polled after the handshake, would flood the log
+                     DIAG_COUNT(remote_diag_dat);
+                     if (remote_kb_active)
+                       remote_diag_log_dat(c, t, kind);
+                   })
               t ^= 0x01;
               rres = ((c << 1) | t) ^ 0xFF;
               *res = rres;
               return 1;
             }
-            if (remote_kb_active)
-              remote_diag_log_dat(0, 0, 0); // the real register answers
+            DIAG(if (remote_kb_active) remote_diag_log_dat(0, 0, 0);) // the real register answers
           }
           return 0;
           break;
         case JOY0DAT:
-          if (remote_joystick_present() && type <= OP_TYPE_LONGWORD)
-            __atomic_fetch_add(&remote_diag_joydat[0][type], 1, __ATOMIC_RELAXED);
+          DIAG(if (remote_joystick_present() && type <= OP_TYPE_LONGWORD) DIAG_COUNT(remote_diag_joydat[0][type]);)
           if (type == OP_TYPE_LONGWORD && remote_joystick_present() && !mouse_hook_enabled) {
             // one 32 bit read gets JOY0DAT and JOY1DAT: keep the real port 1, replace the port 2 half
             *res = ((uint32_t)ps_read(type, addr) & 0xFFFF0000u) | remote_joystick_dat();
@@ -1014,8 +957,7 @@ static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t 
         case JOY1DAT:
         case JOY1DAT + 1: // low byte, for games that read the two counters with byte accesses
           if (remote_joystick_present()) {
-            if (type <= OP_TYPE_LONGWORD)
-              __atomic_fetch_add(&remote_diag_joydat[1][type], 1, __ATOMIC_RELAXED);
+            DIAG(if (type <= OP_TYPE_LONGWORD) DIAG_COUNT(remote_diag_joydat[1][type]);)
             uint16_t v = remote_joystick_dat();
             if (type == OP_TYPE_BYTE)
               *res = (addr & 1) ? (v & 0xFF) : (v >> 8); // the result is the byte at that address, not the word
@@ -1227,8 +1169,7 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
       switch (addr) {
         case INTREQ: {
           int handled;
-          if ((val & 0x0008) && !(val & 0x8000))
-            __atomic_fetch_add(&remote_diag_intreq, 1, __ATOMIC_RELAXED);
+          DIAG(if ((val & 0x0008) && !(val & 0x8000)) DIAG_COUNT(remote_diag_intreq);)
           handled = amiga_handle_intrq_write(val);
           // PORTS acknowledged: if more keys are waiting, ask for the next interrupt
           if ((val & 0x0008) && !(val & 0x8000) && (kb_hook_enabled || remote_kb_active))
@@ -1249,6 +1190,7 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           return 0;
           break;
         }
+#ifdef REMOTE_DIAG
         case CIAAPRA + 0x200: // CIA-A DDRA
           remote_diag_ddra = (int32_t)(val & 0xFF);
           return 0;
@@ -1257,6 +1199,7 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           remote_diag_potgo = (int32_t)(val & 0xFFFF);
           return 0;
           break;
+#endif
         case CIAAPRA:
           if (ovl != (val & (1 << 0))) {
             ovl = (val & (1 << 0));
@@ -1274,11 +1217,7 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
           break;
         }
         case INTENA: {
-          {
-            uint32_t n = remote_diag_intena_count;
-            remote_diag_intena_log[n % INTENA_LOG_SIZE] = (struct intena_log_entry){type, (uint16_t)(addr & 0xFFFF), val};
-            __atomic_store_n(&remote_diag_intena_count, n + 1, __ATOMIC_RELEASE);
-          }
+          DIAG(remote_diag_log_intena(type, addr, val);)
           // This code is kind of strange and should probably be reworked/revoked.
           uint8_t enable = 1;
           if (!(val & 0x8000))

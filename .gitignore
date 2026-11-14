@@ -20,3 +20,6 @@
 
 # local scratch (config and ROM copies)
 /temp/
+
+# remote diagnostics build stamp
+/.remote_diag.*
