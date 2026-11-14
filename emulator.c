@@ -827,12 +827,23 @@ static inline void ps_write(uint8_t type, uint32_t addr, uint32_t val) {
   return;
 }
 
+// CIA-A only decodes A8-A11 to select its register and sits on D0-D7 (odd byte addresses): $bfe003 and $bfe0ff are PRA
+// like $bfe001, $bfe801 is the same register as $bfe8ff... Games do read the fire button through such mirrors
+// (Battle Squadron at $bfe003, Deluxe Galaga at $bfe0ff). Use the canonical address to recognise the register, the
+// access itself still goes to the address the Amiga used.
+static inline uint32_t cia_a_canonical(uint8_t type, uint32_t addr) {
+  if (type == OP_TYPE_BYTE && (addr & 0xFFF001) == 0xBFE001)
+    return 0xBFE001 | (addr & 0x000F00);
+  return addr;
+}
+
 static inline int32_t platform_read_check(uint8_t type, uint32_t addr, uint32_t *res) {
   switch (cfg->platform->id) {
     case PLATFORM_AMIGA:
       if ((remote_joystick_mask() & 0x10) && remote_joystick_present() &&
           ((addr >> 16) == 0xBF || (addr & 0xFFFE00) == 0xDFF000))
         fire_census_hit(type, addr);
+      addr = cia_a_canonical(type, addr);
       switch (addr) {
         case INTREQR:
           return amiga_handle_intrqr_read(res);
@@ -1137,6 +1148,7 @@ static inline int32_t platform_write_check(uint8_t type, uint32_t addr, uint32_t
       }
       break;
     case PLATFORM_AMIGA:
+      addr = cia_a_canonical(type, addr);
       switch (addr) {
         case INTREQ: {
           int handled;
