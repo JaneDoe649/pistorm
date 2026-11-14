@@ -153,6 +153,18 @@ uint16_t irq_delay = 0;
 unsigned int amiga_reset=0, amiga_reset_last=0;
 unsigned int do_reset=0;
 
+// While an interrupt is pending the CPU only runs 5 cycles per loop and reads the CPLD status register each time, so as
+// to take the interrupt as soon as the Amiga unmasks it. When the CPU masks that level (SR interrupt mask >= level) this
+// is pure loss: the code that holds the mask, typically a game redrawing its screen with SR=$2700, crawls (seconds
+// instead of milliseconds) for as long as the interrupt stays pending, e.g. an unread remote keypress. The core itself
+// checks for pending interrupts whenever SR is written, so running full slices while masked loses no latency.
+static inline int irq_deliverable(void) {
+  if (!last_last_irq)
+    return 1; // not presented to the core yet
+  unsigned mask = (m68k_get_reg(NULL, M68K_REG_SR) >> 8) & 7;
+  return last_last_irq == 7 || last_last_irq > mask;
+}
+
 void *ipl_task(void *args) {
   printf("IPL thread running\n");
   uint16_t old_irq = 0;
@@ -328,7 +340,7 @@ cpu_loop:
   }
   else {
     if (cpu_emulation_running) {
-		if (irq)
+		if (irq && irq_deliverable())
 			m68k_execute_bef(state, 5);
 		else
 			m68k_execute_bef(state, loop_cycles);
