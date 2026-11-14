@@ -43,6 +43,71 @@ extern struct fire_census_entry remote_diag_fire_census[FIRE_CENSUS_SIZE];
 struct intena_log_entry { uint8_t type; uint16_t addr_lo; uint32_t val; };
 extern struct intena_log_entry remote_diag_intena_log[INTENA_LOG_SIZE];
 extern uint32_t remote_diag_intena_count;
+#define CODE_DUMP_SIZE 256
+extern uint32_t remote_diag_dump_addr;
+extern int remote_diag_dump_req, remote_diag_dump_done;
+extern uint8_t remote_diag_dump_buf[CODE_DUMP_SIZE];
+
+// Where the CPU spends the stuck window: PC/SR sampled from this thread (racy but good enough for a histogram), and
+// the memory around the most frequent PC, copied by the CPU thread.
+static int64_t now_msec(void);
+#define PC_SAMPLES 40
+static uint32_t pc_samples[PC_SAMPLES], sr_samples[PC_SAMPLES];
+static int n_pc_samples = 0;
+static uint32_t dump_base = 0;
+static int dump_pending = 0;
+
+static void sample_pc(void) {
+  static int64_t last = 0;
+  int64_t now = now_msec();
+  if (n_pc_samples >= PC_SAMPLES || now - last < 15)
+    return;
+  last = now;
+  pc_samples[n_pc_samples] = m68k_get_reg(NULL, M68K_REG_PC);
+  sr_samples[n_pc_samples++] = m68k_get_reg(NULL, M68K_REG_SR);
+}
+
+static void report_pc_histogram(void) {
+  printf("[REMOTE]   PC samples (%d):", n_pc_samples);
+  uint32_t best = 0;
+  int best_n = 0;
+  for (int i = 0; i < n_pc_samples; i++) {
+    int n = 0, seen = 0;
+    for (int j = 0; j < n_pc_samples; j++)
+      if (pc_samples[j] == pc_samples[i])
+        n++;
+    for (int j = 0; j < i; j++)
+      if (pc_samples[j] == pc_samples[i])
+        seen = 1;
+    if (!seen)
+      printf(" %08x(SR=%04x)x%d", pc_samples[i], sr_samples[i], n);
+    if (n > best_n) {
+      best_n = n;
+      best = pc_samples[i];
+    }
+  }
+  printf("\n");
+  if (best_n) {
+    dump_base = (best & ~1u) - 0x80;
+    remote_diag_dump_addr = dump_base;
+    __atomic_store_n(&remote_diag_dump_done, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&remote_diag_dump_req, 1, __ATOMIC_RELEASE);
+    dump_pending = 1;
+  }
+}
+
+static void print_code_dump(void) {
+  if (!dump_pending || !__atomic_load_n(&remote_diag_dump_done, __ATOMIC_ACQUIRE))
+    return;
+  dump_pending = 0;
+  printf("[REMOTE]   memory around the busiest PC:\n");
+  for (int i = 0; i < CODE_DUMP_SIZE; i += 16) {
+    printf("[REMOTE]   %08x:", dump_base + i);
+    for (int k = 0; k < 16; k += 2)
+      printf(" %02x%02x", remote_diag_dump_buf[i + k], remote_diag_dump_buf[i + k + 1]);
+    printf("\n");
+  }
+}
 
 // Registers read by the Amiga while the joystick fire was down, printed when the fire is released
 static void print_fire_census(void) {
@@ -182,8 +247,10 @@ static void watch_queue(void) {
   if (!queued) {
     nonempty_since = 0;
     reported = 0;
+    n_pc_samples = 0;
     return;
   }
+  sample_pc();
   int64_t now = now_msec();
   if (!nonempty_since) {
     nonempty_since = now;
@@ -212,6 +279,7 @@ static void watch_queue(void) {
       printf(" %s@%04x=0x%08x", e->type == 0 ? "b" : (e->type == 1 ? "w" : "l"), (unsigned)e->addr_lo, (unsigned)e->val);
     }
     printf("\n");
+    report_pc_histogram();
   }
 }
 
@@ -433,6 +501,7 @@ static void *remote_task(void *arg) {
     watch_queue();
     watch_held_keys();
     watch_joystick_reads();
+    print_code_dump();
     print_dat_log();
     if (kb_irq_wanted())
       kick_keyboard_irq();

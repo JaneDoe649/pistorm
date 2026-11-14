@@ -59,6 +59,11 @@ int32_t remote_diag_pra_type = -1, remote_diag_pra_fire = -1, remote_diag_ddra =
 // every CIA / custom register read (address, width) while the remote joystick fire is down, to see which one a game
 // really uses to read the button. Filled by the CPU thread, printed and cleared by the remote input thread.
 // last writes to INTENA (width and value as seen by the hook): our shadow of the master enable is rebuilt from them
+// memory dump requested by the remote input thread when the queue is stuck: only the CPU thread may touch the bus
+#define CODE_DUMP_SIZE 256
+uint32_t remote_diag_dump_addr = 0;
+int remote_diag_dump_req = 0, remote_diag_dump_done = 0;
+uint8_t remote_diag_dump_buf[CODE_DUMP_SIZE];
 #define INTENA_LOG_SIZE 8
 struct intena_log_entry { uint8_t type; uint16_t addr_lo; uint32_t val; };
 struct intena_log_entry remote_diag_intena_log[INTENA_LOG_SIZE];
@@ -326,6 +331,12 @@ cpu_loop:
   remote_mouse_poll();
   // keyboard: the CPU thread is the only one raising the emulated PORTS interrupt, other threads only ask for it
   kb_sdr_tick();
+  if (__atomic_load_n(&remote_diag_dump_req, __ATOMIC_ACQUIRE)) {
+    for (int i = 0; i < CODE_DUMP_SIZE; i++)
+      remote_diag_dump_buf[i] = (uint8_t)m68k_read_memory_8(remote_diag_dump_addr + i);
+    __atomic_store_n(&remote_diag_dump_req, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&remote_diag_dump_done, 1, __ATOMIC_RELEASE);
+  }
   if (kb_irq_poll() && (kb_hook_enabled || remote_kb_active) && !amiga_emulating_irq(PORTS))
     amiga_emulate_irq(PORTS);
   if (mouse_hook_enabled) {
